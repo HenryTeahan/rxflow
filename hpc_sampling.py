@@ -24,21 +24,27 @@ def sample_ligand(row, output, executable, *, endpoint_conformers=3, coembed_con
             (output / f"{prefix}_endpoints.json").write_text(json.dumps({
                 "reactant": rxembed.cxsmiles(reactant), "product": rxembed.cxsmiles(product),
                 "substrate": row["substrate"]}, indent=2) + "\n")
-            try:
-                for role, isomer in (("reactant", reactant), ("product", product)):
+            for role, isomer in (("reactant", reactant), ("product", product)):
+                try:
                     ensemble = rxembed.embed(isomer, n=endpoint_conformers, seed=seed, threads=1)
                     if not ensemble.ids:
                         raise ValueError(f"No {role} conformers embedded")
                     for conformer, cid in enumerate(ensemble.ids, 1):
                         path = output / role / f"{prefix}_conformer_{conformer:03d}_input.xyz"
                         path.write_text(Chem.MolToXYZBlock(ensemble.restored_mol(cid)))
+                    if len(ensemble.ids) < endpoint_conformers:
+                        raise ValueError(f"Only {len(ensemble.ids)} of {endpoint_conformers} {role} conformers embedded")
+                except Exception as exc:
+                    errors.append({"pair": index, "seating": seating + 1, "endpoint": role, "error": str(exc)})
+            try:
                 generate_ts_guess(reactant, product, output, prefix=prefix, n=coembed_conformers, seed=seed)
                 groups += 1
-            except (RuntimeError, ValueError, OSError) as exc:
-                errors.append({"pair": index, "seating": seating + 1, "error": str(exc)})
+            except Exception as exc:
+                errors.append({"pair": index, "seating": seating + 1, "endpoint": "TS", "error": str(exc)})
     summary = dict(ligand_id=row["ID"], groups=groups, errors=errors,
                    endpoint_conformers=endpoint_conformers, coembed_conformers=coembed_conformers, seed=seed)
+    if not groups and not errors:
+        errors.append({"error": "No reaction/seating groups produced"})
+    summary["status"] = "completed_with_errors" if errors else "complete"
     (output / "sampling.json").write_text(json.dumps(summary, indent=2) + "\n")
-    if errors or not groups:
-        raise RuntimeError(f"Ligand {row['ID']}: incomplete sampling; inspect {output / 'sampling.json'}")
     return summary

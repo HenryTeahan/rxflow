@@ -156,15 +156,20 @@ rxflow submit --account YOUR_ACCOUNT --partition YOUR_PARTITION
 ```
 
 Omit account/partition options when your cluster supplies defaults. `submit`
-determines the sampling array size from the CSV, runs one CPU per ligand, then
-submits database preparation and the ORCA worker array with `afterok` dependencies.
+determines the sampling array size from the CSV and runs one CPU per ligand.
+Database preparation waits for sampling to finish (`afterany`), including failed
+tasks; the ORCA worker array waits for successful preparation (`afterok`).
 It prints all three Slurm job IDs and exports the current environment to every job.
 Existing runs are protected: choose fresh source/results paths to start again.
 
 The default is 100 independent ORCA workers (`--workers 100`), one CPU and 2 GB
 RAM per worker as configured in `hpc.toml`, with a 24-hour Slurm time limit per
-stage. Sampling failures hold downstream jobs; inspect `sampling-*.out` and each
-ligand's `sampling.json`. ORCA logs are `orca-*.out` beside the config file.
+stage. Endpoint embedding and TS-guess failures are recorded in each ligand's
+`sampling.json` and as database rows with `status='failed'`, `stage='sampling'`,
+an error message and empty energy fields. Other conformers and reaction groups
+continue. Inspect `sampling-*.out` for failures before a reaction group was
+created; those tasks also do not hold up the other ligands.
+ORCA logs are `orca-*.out` beside the config file.
 Scratch uses Python's temporary directory (`TMPDIR`); set it to node-local storage
 as required by your cluster. Use the cluster's shared filesystem for the database.
 
@@ -233,8 +238,11 @@ energy from thermochemistry, avoiding displaced NumFreq single-point energies.
 See the [ORCA external-program tutorial](https://www.faccts.de/docs/orca/6.1/tutorials/workflows/extopt.html)
 and [thermochemistry manual](https://www.faccts.de/docs/orca/6.1/manual/contents/structurereactivity/thermochemistry.html).
 
-Failed rows are left for inspection. After stopping any previous worker for a
-row, retry explicitly; attempt-specific filenames preserve earlier artifacts:
+Failed rows are left for inspection. For sampling failures, correct the missing
+or invalid seeds and rerun `rxflow prepare`; it reactivates repaired sampling rows
+without resetting completed calculations. For ORCA failures, stop any previous
+worker for the row and retry explicitly; attempt-specific filenames preserve
+earlier artifacts:
 
 ```sh
 rxflow retry --id 42

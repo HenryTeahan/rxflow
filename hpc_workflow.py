@@ -61,20 +61,18 @@ def update_job(connection, job_id, **values):
 
 
 def prepare_jobs(connection, source, root, settings):
-    """Import ready local seeds, never their gas-phase optimized energies or old ORCA inputs."""
+    """Import each usable seed; retain missing/invalid endpoint and TS seeds as failed rows."""
     added, groups = 0, 0
     pair_tables = {}
     for descriptor in sorted(source.glob("ligand_*/pair_*_seating_*_endpoints.json")):
         prefix = descriptor.stem.removesuffix("_endpoints")
         selection_path = descriptor.parent / "ts_guess" / f"{prefix}_selection.json"
-        if not selection_path.exists():
-            continue
+        selection = {}
         try:
-            selection = json.loads(selection_path.read_text())
-        except json.JSONDecodeError:  # The local runner may still be publishing this file.
-            continue
-        if "ts_input" not in selection:
-            continue
+            if selection_path.exists():
+                selection = json.loads(selection_path.read_text())
+        except json.JSONDecodeError:
+            selection = {"error": "Incomplete TS selection JSON"}
         pair, seating = map(int, re.fullmatch(r"pair_(\d+)_seating_(\d+)", prefix).groups())
         ligand_input = json.loads((descriptor.parent / "input.json").read_text())
         ligand_id = str(ligand_input["ID"])
@@ -83,6 +81,9 @@ def prepare_jobs(connection, source, root, settings):
                 pair_tables[descriptor.parent] = list(csv.DictReader(handle))
         reaction = pair_tables[descriptor.parent][pair - 1]
         graphs = json.loads(descriptor.read_text())
+        summary_path = descriptor.parent / "sampling.json"
+        summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
+        errors = [e for e in summary.get("errors", []) if e.get("pair") == pair and e.get("seating") == seating]
         substrate = reaction.get("substrate") or ligand_input.get("substrate") or SUBSTRATE
         if graphs.get("substrate") and graphs["substrate"] != substrate:
             raise ValueError(f"Substrate metadata differs from sampled endpoints: {descriptor}")
@@ -101,16 +102,27 @@ def prepare_jobs(connection, source, root, settings):
             (ligand_id, metadata["binding_mode"], metadata["coordination_isomer"], seating)).fetchone()
         metadata["binding_permutation"] = binding[0] if binding else connection.execute(
             "SELECT coalesce(max(binding_permutation),0)+1 FROM jobs WHERE ligand_id=?", (ligand_id,)).fetchone()[0]
-        inputs = [(role, path) for role in ("reactant", "product")
-                  for path in sorted((descriptor.parent / role).glob(f"{prefix}_conformer_*_input.xyz"))]
-        if {role for role, path in inputs} != {"reactant", "product"}:
-            continue
-        inputs.append(("TS", descriptor.parent / "ts_guess" / f"{prefix}.xyz"))
-        for role, source_xyz in inputs:
+        inputs = []
+        for role in ("reactant", "product"):
+            available = [int(re.search(r"conformer_(\d+)_input", path.name)[1])
+                         for path in (descriptor.parent / role).glob(f"{prefix}_conformer_*_input.xyz")]
+            count = max(summary.get("endpoint_conformers", 1), max(available, default=1))
+            inputs.extend((role, conformer, descriptor.parent / role / f"{prefix}_conformer_{conformer:03d}_input.xyz")
+                          for conformer in range(1, count + 1))
+        inputs.append(("TS", 0, descriptor.parent / "ts_guess" / f"{prefix}.xyz"))
+        for role, conformer, source_xyz in inputs:
             smiles = graphs["reactant" if role == "TS" else role]
-            xyz = source_xyz.read_text()
-            mol = molecule_with_xyz(smiles, xyz)
-            conformer = 0 if role == "TS" else int(re.search(r"conformer_(\d+)_input", source_xyz.name)[1])
+            mol = mapped_molecule(smiles)
+            error, xyz = None, None
+            try:
+                if role == "TS" and ("ts_input" not in selection or selection.get("error")):
+                    raise ValueError(selection.get("error") or "No completed TS guess")
+                xyz = source_xyz.read_text()
+                molecule_with_xyz(smiles, xyz)
+            except (ValueError, OSError) as exc:
+                detail = next((e["error"] for e in errors if e.get("endpoint", role) == role), str(exc))
+                error = f"{role} sampling failed: {detail}"
+                xyz = None
             folder = root / descriptor.parent.name / ("ts_guess" if role == "TS" else role)
             folder.mkdir(parents=True, exist_ok=True)
             target = folder / (f"{prefix}_input.xyz" if role == "TS" else source_xyz.name)
@@ -123,22 +135,27 @@ def prepare_jobs(connection, source, root, settings):
             if previous and any(previous[name] is not None and previous[name] != value
                                 for name, value in metadata.items()):
                 raise ValueError("Existing jobs have different substrate/binding metadata; use a new results directory")
-            if target.exists():
+            if xyz is not None and target.exists():
                 if target.read_text() != xyz:
                     raise ValueError(f"Existing input differs: {target}")
-            else:
+            elif xyz is not None:
                 target.write_text(xyz)
-            atoms = selection["ts_mode"]
+            atoms = selection.get("ts_mode", {})
             cursor = connection.execute("""INSERT OR IGNORE INTO jobs
                 (ligand_id,pair_index,seating,endpoint,conformer,input_xyz,smiles,charge,multiplicity,
                  donor,hydrogen,acceptor,settings_json,substrate,binding_mode,coordination_isomer,
-                 donor_maps,substrate_site,resonance,binding_permutation)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 donor_maps,substrate_site,resonance,binding_permutation,status,stage,error,retained)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (*key, str(target.relative_to(root)), smiles, Chem.GetFormalCharge(mol), 1,
-                 atoms["donor"], atoms["hydrogen"], atoms["acceptor"], protocol, *metadata.values()))
+                 atoms.get("donor"), atoms.get("hydrogen"), atoms.get("acceptor"), protocol, *metadata.values(),
+                 "failed" if error else "pending", "sampling" if error else "opt", error, 0 if error else None))
             added += cursor.rowcount
             if previous and any(previous[name] != value for name, value in metadata.items()):
                 update_job(connection, previous["id"], **metadata)
+            if previous and previous["status"] == "failed" and previous["stage"] == "sampling":
+                update_job(connection, previous["id"], status="failed" if error else "pending",
+                           stage="sampling" if error else "opt", error=error, retained=0 if error else None,
+                           donor=atoms.get("donor"), hydrogen=atoms.get("hydrogen"), acceptor=atoms.get("acceptor"))
         groups += 1
     return added, groups
 
@@ -269,17 +286,17 @@ def submit_workflow(config_path, config, *, workers=100, account=None, partition
         if value:
             common.append(f"--{flag}={value}")
 
-    def submit(name, stage, *, cpus=1, dependency=None, array=None):
+    def submit(name, stage, *, cpus=1, dependency=None, dependency_type="afterok", array=None):
         args = [*common, f"--job-name=rxflow-{name}", f"--cpus-per-task={cpus}",
                 f"--output={base / (name + '-%A_%a.out')}"]
         if dependency:
-            args.append(f"--dependency=afterok:{dependency}")
+            args.append(f"--dependency={dependency_type}:{dependency}")
         if array:
             args.append(f"--array={array}")
         return subprocess.check_output([*args, "--wrap", wrap + " " + stage], text=True).strip().split(";")[0]
 
     sampling = submit("sampling", 'sample --ligand-index "$SLURM_ARRAY_TASK_ID"', array=f"0-{len(rows) - 1}")
-    prepared = submit("prepare", "prepare", dependency=sampling)
+    prepared = submit("prepare", "prepare", dependency=sampling, dependency_type="afterany")
     orca = submit("orca", "worker", cpus=config["calculation"]["cpus"],
                   dependency=prepared, array=f"0-{workers - 1}%{workers}")
     return dict(sampling=sampling, prepare=prepared, orca=orca)
@@ -340,7 +357,7 @@ def main(argv=None):
     connection = connect_database(root / "workflow.sqlite")
     try:
         if args.command == "prepare":
-            print("New jobs, ready reaction/seating groups:", prepare_jobs(connection,
+            print("New jobs, reaction/seating groups:", prepare_jobs(connection,
                 (base / config["paths"]["source"]).resolve(), root, settings))
         elif args.command == "worker":
             while (job := claim_job(connection)) is not None:
@@ -349,6 +366,9 @@ def main(argv=None):
         elif args.command == "retry":
             if args.id is None:
                 parser.error("retry requires --id; stop the previous worker before retrying a running row")
+            row = connection.execute("SELECT stage FROM jobs WHERE id=?", (args.id,)).fetchone()
+            if row and row["stage"] == "sampling":
+                parser.error("Sampling failures need corrected seeds followed by prepare; they cannot be retried as ORCA jobs")
             connection.execute("UPDATE jobs SET status='pending',stage='opt',error=NULL,retained=NULL,"
                                "electronic_energy_eh=NULL,gibbs_free_energy_eh=NULL,frequencies_json=NULL,"
                                "imaginary_count=NULL,xyz_file=NULL,out_file=NULL,worker_id=NULL "
