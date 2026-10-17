@@ -200,7 +200,7 @@ def select_endpoints(connection, job):
 
 
 def run_job(connection, job, root, executables):
-    """Optimize an endpoint or relax/refine a TS, then collect a separate ORCA NumFreq."""
+    """Optimize endpoints or try direct OptTS before relaxation, then separate NumFreq."""
     settings = {**json.loads(job["settings_json"]), **executables}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
 
@@ -230,20 +230,26 @@ def run_job(connection, job, root, executables):
             if any(changes.values()):
                 raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
         else:
-            result = calculate("relax", 1)
-            for attempt in range(2, settings["ts_attempts"] + 1):
-                if result["converged"] or not result.get("max_cycles_reached") or not result.get("xyz"):
-                    break
+            result = calculate("optts", 1)
+            if result["converged"] and result["xyz"]:
                 current = result["xyz"]
-                result = calculate("relax", attempt)
-            if not result["converged"] or not result["xyz"]:
-                raise RuntimeError("Constrained TS relaxation did not converge")
-            current = result["xyz"]
-            for attempt in range(1, settings["ts_attempts"] + 1):
-                result = calculate("optts", attempt)
-                current = result["xyz"] or current
-                if result["converged"] and result["xyz"]:
-                    break
+            else:
+                # Relax the original guess, not the failed direct OptTS geometry.
+                current = original
+                result = calculate("relax", 1)
+                for attempt in range(2, settings["ts_attempts"] + 1):
+                    if result["converged"] or not result.get("max_cycles_reached") or not result.get("xyz"):
+                        break
+                    current = result["xyz"]
+                    result = calculate("relax", attempt)
+                if not result["converged"] or not result["xyz"]:
+                    raise RuntimeError("Constrained TS relaxation did not converge")
+                current = result["xyz"]
+                for attempt in range(2, settings["ts_attempts"] + 2):
+                    result = calculate("optts", attempt)
+                    current = result["xyz"] or current
+                    if result["converged"] and result["xyz"]:
+                        break
             if not result["converged"] or not result["xyz"]:
                 if not settings["neb_fallback"]:
                     raise RuntimeError("OptTS attempts did not converge")

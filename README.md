@@ -238,9 +238,12 @@ original substrate and geometries.
 Endpoint jobs run ORCA optimization and a **separate NumFreq**, reject only graph
 changes accompanied by a distance shift greater than 2 Å, and retain valid minima
 within 3 kcal/mol of the lowest electronic energy. Minima require zero imaginary
-frequencies. A TS waits for its endpoint jobs, constrains the transferring H and
-its donor/acceptor during relaxation, tries OptTS twice, and uses NEB-TS if both
-attempts fail. Separate NumFreq must then give exactly one imaginary frequency.
+frequencies. A TS waits for its endpoint jobs and first tries OptTS directly from
+the original TS guess. If that attempt fails, it returns to the original guess,
+relaxes with the transferring H and its donor/acceptor constrained, and tries
+OptTS up to `ts_attempts` more times (default 2), continuing from the latest geometry.
+NEB-TS is the fallback if those OptTS attempts fail.
+Separate NumFreq must then give exactly one imaginary frequency.
 NEB uses the original coembedded reactant and product geometries with the rxts
 TS guess, preserving their shared atom mapping and alignment.
 
