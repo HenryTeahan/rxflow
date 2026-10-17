@@ -13,6 +13,7 @@ dependencies = [
     "ipykernel",
     "jupyterlab",
     "nbformat",
+    "xyzrender",
 ]
 
 [project.scripts]
@@ -28,3 +29,4 @@ override-dependencies = ["rxembed"]
 [tool.uv.sources]
 rxembed = { git = "https://github.com/aligfellow/rxembed.git", rev = "2c60b21f0eb0aebb5361bae2a968050b616c4dd9" }
 rxts = { git = "https://github.com/HenryTeahan/rxts.git", rev = "8eac9f1b2a2d13e52b47a1438961e0fe68a45f47" }
+xyzrender = { git = "https://github.com/HenryTeahan/xyzrender.git", rev = "792799503b31d3a447326bc01444b074286dadb2" }

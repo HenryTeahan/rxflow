@@ -13,7 +13,7 @@ rxflow --help
 ```
 
 `uv sync --locked` installs rxflow and all Python dependencies, including GitHub
-`rxembed` and `rxts`; no sibling checkouts are needed. `rxembed` is pinned to
+`rxembed`, `rxts` and `xyzrender`; no sibling checkouts are needed. `rxembed` is pinned to
 [PR #28](https://github.com/aligfellow/rxembed/pull/28), commit
 `2c60b21f0eb0aebb5361bae2a968050b616c4dd9`. `rxts` uses
 [HenryTeahan/rxts](https://github.com/HenryTeahan/rxts), pinned to
