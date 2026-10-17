@@ -10,7 +10,8 @@ from rxflow import generate_reaction_pairs
 from rxflow_endpoints import create_endpoint_isomers, generate_ts_guess
 
 
-def sample_ligand(row, output, executable, *, endpoint_conformers=3, coembed_conformers=10, seed=12345):
+def sample_ligand(row, output, executable, *, endpoint_conformers=3, coembed_conformers=10,
+                  ts_candidates=5, seed=12345):
     """Screen binding modes, embed endpoints, and coembed TS guesses without endpoint optimization."""
     output = Path(output)
     if output.exists() and any(output.iterdir()):
@@ -37,12 +38,14 @@ def sample_ligand(row, output, executable, *, endpoint_conformers=3, coembed_con
                 except Exception as exc:
                     errors.append({"pair": index, "seating": seating + 1, "endpoint": role, "error": str(exc)})
             try:
-                generate_ts_guess(reactant, product, output, prefix=prefix, n=coembed_conformers, seed=seed)
+                generate_ts_guess(reactant, product, output, prefix=prefix, n=coembed_conformers,
+                                  keep=ts_candidates, seed=seed)
                 groups += 1
             except Exception as exc:
                 errors.append({"pair": index, "seating": seating + 1, "endpoint": "TS", "error": str(exc)})
     summary = dict(ligand_id=row["ID"], groups=groups, errors=errors,
-                   endpoint_conformers=endpoint_conformers, coembed_conformers=coembed_conformers, seed=seed)
+                   endpoint_conformers=endpoint_conformers, coembed_conformers=coembed_conformers,
+                   ts_candidates=ts_candidates, seed=seed)
     if not groups and not errors:
         errors.append({"error": "No reaction/seating groups produced"})
     summary["status"] = "completed_with_errors" if errors else "complete"

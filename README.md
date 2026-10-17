@@ -175,6 +175,15 @@ failed and running rows unchanged; workers claim only pending rows. Failed rows
 must first be reset with `rxflow retry --id ID`. Rows left running by killed workers
 also require an explicit retry after the old workers have stopped.
 
+Sampling coembeds 10 pairs and creates TS guesses from the five lowest TS RMSDs
+(`sampling.ts_candidates = 5`), or fewer if fewer pairs survive. Each candidate
+gets a separate TS row: `conformer=1..5` is its RMSD rank, `ts_rmsd` records the
+score, and `ts_strategy='direct'` identifies a direct OptTS job. A separate
+`conformer=0`, `ts_strategy='neb'` row is the conditional NEB fallback.
+Existing single-guess seeds retain their previous behavior; retrying old rows
+does not generate additional candidates. Multiple candidates require new sampling.
+Geometry-optimization cycle limits use ORCA's defaults; inputs do not set `MaxIter`.
+
 The default is 100 independent ORCA workers (`--workers 100`), one CPU and 2 GB
 RAM per worker as configured in `hpc.toml`, with a 24-hour Slurm time limit per
 stage. Endpoint embedding and TS-guess failures are recorded in each ligand's
@@ -208,7 +217,7 @@ Calculation settings are frozen per row during preparation; use a new results
 directory when changing the protocol. The local runner remains separate.
 
 Each worker atomically claims a row in `hpc_results/workflow.sqlite`. Its single
-`jobs` table holds one row per endpoint conformer and one TS per ligand/pair/seating,
+`jobs` table holds one row per endpoint conformer and per TS candidate/fallback per ligand/pair/seating,
 including status, stage, attempts, geometries, electronic/Gibbs energies in Eh,
 frequencies and errors. Paths are relative to `hpc_results/`; XYZ, INP, OUT and Hessian
 files stay directly in `ligand_XX/{reactant,product,ts_guess}/`. Use shared storage
@@ -238,12 +247,17 @@ original substrate and geometries.
 Endpoint jobs run ORCA optimization and a **separate NumFreq**, reject only graph
 changes accompanied by a distance shift greater than 2 Å, and retain valid minima
 within 3 kcal/mol of the lowest electronic energy. Minima require zero imaginary
-frequencies. A TS waits for its endpoint jobs and first tries OptTS directly from
-the original TS guess. If that attempt fails, it returns to the original guess,
-relaxes with the transferring H and its donor/acceptor constrained, and tries
-OptTS up to `ts_attempts` more times (default 2), continuing from the latest geometry.
-NEB-TS is the fallback if those OptTS attempts fail.
-Separate NumFreq must then give exactly one imaginary frequency.
+frequencies. If the first endpoint NumFreq finds any imaginary frequencies, run
+VeryTightOpt from that optimized geometry, check connectivity again, and repeat
+NumFreq once. TS jobs do not use this recovery.
+A TS candidate waits for its endpoint jobs and runs direct OptTS followed by
+separate NumFreq, which must give exactly one imaginary frequency. Among successful
+candidates for each ligand/pair/seating, only the lowest Gibbs-energy TS has
+`retained=1`; all candidate results remain in the database. The fallback waits
+until every candidate finishes. If any succeeds, the fallback is marked `skipped`;
+otherwise it runs NEB-TS followed by NumFreq. New multi-candidate jobs do not use
+constrained pre-relaxation. Historical single-guess jobs still try direct OptTS,
+then constrained relaxation/OptTS retries, then NEB.
 NEB uses the original coembedded reactant and product geometries with the rxts
 TS guess, preserving their shared atom mapping and alignment.
 

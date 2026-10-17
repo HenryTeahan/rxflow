@@ -26,17 +26,17 @@ STEP 2:
 
 	1.2 For these 3 conformers, we want to perform gxTB optimizations: We now will be using an orca calculation - using extparams for the gxtb binary, and extparam for the h2o solvent.
 	1.3 Select the conformers within 3 kcal/mol of the lowest. Only discard an optimization for connectivity if the graph changes AND the associated atom-pair distance changes by more than 2 angstrom from its starting value.
-	2. Embed smiles using rxembed.coembed: request 10 paired conformers and select the pair with the lowest ts_rmsds value.
-	2.1 Using rxts, create a transitionstateguesser object, and make one TS guess from that selected pair.
+	2. Embed smiles using rxembed.coembed: request 10 paired conformers and select the 5 lowest ts_rmsds pairs (or all surviving pairs if fewer than 5).
+	2.1 Using rxts, make a TS guess from each selected pair. Keep the lowest-TS-RMSD coembedded endpoints and TS guess for NEB fallback.
 	2.2a ---- Note: We will now be using ORCA for the following: there needs to be specific and ORCA_EXE.
-	2.2 Constrained relax this guess, keeping the TS atoms constrained to their TS guess positions.
-	2.3 For each constrained relaxed TS guess, we want to write an input file, containing the guess structure, numhess = true, calcfreq=true and the TS mode with the right atom indexes.
+	2.2 Run direct OptTS for each guess without constrained pre-relaxation.
+	2.3 Use numerical Hessians and the TS mode with the right atom indexes.
 
 STEP 3:
 	Going from TS guess -> Full endpoint + TS reaction scheme.
 	1. After creating the TS guess geometries, we want to use a TS optimizing routine.
-	2. In inspiration/workflow_orca.py, a draft for this is theorized. First try optts until it converges or we give up -> alternatively, NEB fallback.
-	3. Finally, once converged, we want to run a numfreq. Only success criteria is 1 imaginary frequency.
+	2. Run separate NumFreq on every converged OptTS; require exactly 1 imaginary frequency. Keep a database row for each candidate and retain the lowest Gibbs-energy successful TS per ligand/pair/seating.
+	3. Only if all direct candidates fail, use NEB with the lowest-TS-RMSD coembedded endpoints and its original TS guess, followed by separate NumFreq.
 
 
 GUIDANCE: This should be a very minimal but clearly written code structure. Do not abstract functions too much. Use the code supplied by me as much as possible.

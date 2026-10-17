@@ -166,10 +166,12 @@ def write_ts_input(guess, reactant, product, output, *, method="r2SCAN-3c", mult
 
 
 def generate_ts_guess(reactant, product, output, *, prefix="reaction", n=10, seed=12345,
-                      multiplicity=1, method="r2SCAN-3c"):
-    """Coembed n endpoint pairs and create a TS guess from the lowest TS RMSD pair."""
+                      multiplicity=1, method="r2SCAN-3c", keep=1):
+    """Coembed n pairs and make guesses from the keep lowest-TS-RMSD pairs."""
     import rxts
 
+    if keep < 1:
+        raise ValueError("At least one TS candidate is required")
     output = Path(output)
     for role in ("reactant", "product", "ts_guess"):
         directory = output / role
@@ -187,37 +189,50 @@ def generate_ts_guess(reactant, product, output, *, prefix="reaction", n=10, see
     if not rmsds:
         selection_path.write_text(json.dumps(selection, indent=2, default=str) + "\n")
         raise ValueError("No coembedded endpoint pairs survived")
-    best_id = min(rmsds, key=rmsds.get)
+    ranked = sorted(rmsds, key=rmsds.get)[:keep]
+    best_id = ranked[0]
     selection.update(selected_conformer_id=best_id, selected_ts_rmsd=rmsds[best_id])
     selection_path.write_text(json.dumps(selection, indent=2, default=str) + "\n")
-    left, right = paired[paired.ids.index(best_id)]
-    # Align product XYZ order using the complete coembedding correspondence.
     correspondence = dict(paired.correspondence)
-    right = Chem.RenumberAtoms(right, [correspondence[i] for i in range(left.GetNumAtoms())])
-    donor, hydrogen, acceptor = hydrogen_transfer(left, right)
-    (output / "reactant" / f"{prefix}_reactive.xyz").write_text(Chem.MolToXYZBlock(left))
-    (output / "product" / f"{prefix}_reactive.xyz").write_text(Chem.MolToXYZBlock(right))
-    guesser = rxts.TransitionStateGuesser(
-        engine="gfnff", gfnff_topology="graph", charge=Chem.GetFormalCharge(left),
-        multiplicity=multiplicity, n_cores=1, n_conformers=1, n_embed=0,
-        mapping=list(range(left.GetNumAtoms())),
-        forming_bonds=[(acceptor, hydrogen)], breaking_bonds=[(donor, hydrogen)],
-    )
     ts_directory = output / "ts_guess"
-    try:
-        path = guesser.find_transition_state(left, right)
-        guess = path.guess("ff")
-        guess.dump(ts_directory / f"{prefix}.xyz")
-        path.dump(ts_directory / f"{prefix}_path.xyz")
-        indices = write_ts_input(guess.mol, path.reactant, path.product, ts_directory / f"{prefix}.inp",
-                                 method=method, multiplicity=multiplicity)
-        selection.update(ts_input=str((ts_directory / f"{prefix}.inp").resolve()), ts_mode=indices,
-                         ff_barrier_kcal_mol=path.barrier("ff"), peak_lambda=path.peak_lambda("ff"))
-    except (RuntimeError, ValueError, OSError) as exc:
-        selection["error"] = str(exc)
-        raise
-    finally:
+    candidates = []
+    for rank, cid in enumerate(ranked, 1):
+        name = prefix if keep == 1 else f"{prefix}_conformer_{rank:03d}"
+        candidate = dict(rank=rank, selected_conformer_id=cid, selected_ts_rmsd=rmsds[cid])
+        try:
+            left, right = paired[paired.ids.index(cid)]
+            # Align each product to the common coembedding atom order.
+            right = Chem.RenumberAtoms(right, [correspondence[i] for i in range(left.GetNumAtoms())])
+            donor, hydrogen, acceptor = hydrogen_transfer(left, right)
+            if rank == 1:
+                (output / "reactant" / f"{prefix}_reactive.xyz").write_text(Chem.MolToXYZBlock(left))
+                (output / "product" / f"{prefix}_reactive.xyz").write_text(Chem.MolToXYZBlock(right))
+            guesser = rxts.TransitionStateGuesser(
+                engine="gfnff", gfnff_topology="graph", charge=Chem.GetFormalCharge(left),
+                multiplicity=multiplicity, n_cores=1, n_conformers=1, n_embed=0,
+                mapping=list(range(left.GetNumAtoms())),
+                forming_bonds=[(acceptor, hydrogen)], breaking_bonds=[(donor, hydrogen)],
+            )
+            path = guesser.find_transition_state(left, right)
+            guess = path.guess("ff")
+            guess.dump(ts_directory / f"{name}.xyz")
+            path.dump(ts_directory / f"{name}_path.xyz")
+            indices = write_ts_input(guess.mol, path.reactant, path.product, ts_directory / f"{name}.inp",
+                                     method=method, multiplicity=multiplicity)
+            candidate.update(ts_input=str((ts_directory / f"{name}.inp").resolve()), ts_mode=indices,
+                             ff_barrier_kcal_mol=path.barrier("ff"), peak_lambda=path.peak_lambda("ff"))
+            if rank == 1 and keep > 1:
+                shutil.copy2(ts_directory / f"{name}.xyz", ts_directory / f"{prefix}.xyz")
+        except (RuntimeError, ValueError, OSError) as exc:
+            candidate["error"] = str(exc)
+        candidates.append(candidate)
+        if rank == 1:
+            selection.update(candidate)
+        if keep > 1:
+            selection["candidates"] = candidates
         selection_path.write_text(json.dumps(selection, indent=2, default=str) + "\n")
+    if not any("error" not in candidate for candidate in candidates):
+        raise ValueError("No TS guesses survived: " + "; ".join(c["error"] for c in candidates))
     return selection
 
 

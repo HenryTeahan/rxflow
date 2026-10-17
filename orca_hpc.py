@@ -44,13 +44,13 @@ def orca_input(xyz, stage, charge, multiplicity, settings, atoms=()):
     external = settings["external_exe"]
     if any(c in external + parameters for c in ('"', '\n', '\r')):
         raise ValueError("ORCA external paths/parameters contain quote or newline delimiters")
-    keyword = {"opt": "Opt", "tightopt": "TightOpt", "relax": "Opt", "optts": "OptTS",
+    keyword = {"opt": "Opt", "verytightopt": "VeryTightOpt", "relax": "Opt", "optts": "OptTS",
                "neb": "NEB-TS", "freq": "NumFreq"}[stage]
     header = (f"! ExtOpt {keyword}\n%pal nprocs {settings['cpus']} end\n"
               f"%maxcore {int(settings['memory_mb'] * 0.75 / settings['cpus'])}\n"
               f'%method\n ProgExt "{external}"\n Ext_Params "{parameters}"\nend\n')
-    if stage in ("opt", "tightopt", "relax", "optts"):
-        header += f"%geom\n MaxIter {settings['max_iterations']}\n"
+    if stage in ("relax", "optts"):
+        header += "%geom\n"
         if stage == "relax":
             header += " Constraints\n" + "".join(f"  {{C {i} C}}\n" for i in atoms) + " end\n"
         if stage == "optts":

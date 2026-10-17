@@ -11,13 +11,13 @@ xtb_exe = "${XTB_EXE}"
 [sampling]
 endpoint_conformers = 3
 coembed_conformers = 10
+ts_candidates = 5
 seed = 12345
 
 [calculation]
 solvent = "h2o"
 cpus = 1
 memory_mb = 2000
-max_iterations = 100
 opt_attempts = 2
 ts_attempts = 2
 neb_fallback = true

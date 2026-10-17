@@ -47,7 +47,8 @@ def connect_database(path):
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
     for name, kind in {"substrate": "TEXT", "binding_permutation": "INTEGER",
                        "binding_mode": "INTEGER", "coordination_isomer": "INTEGER",
-                       "donor_maps": "TEXT", "substrate_site": "INTEGER", "resonance": "INTEGER"}.items():
+                       "donor_maps": "TEXT", "substrate_site": "INTEGER", "resonance": "INTEGER",
+                       "ts_rmsd": "REAL", "ts_strategy": "TEXT"}.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
     return connection
@@ -61,6 +62,7 @@ def update_job(connection, job_id, **values):
 
 def prepare_jobs(connection, source, root, settings):
     """Import each usable seed; retain missing/invalid endpoint and TS seeds as failed rows."""
+    settings = {key: value for key, value in settings.items() if key != "max_iterations"}
     added, groups = 0, 0
     pair_tables = {}
     for descriptor in sorted(source.glob("ligand_*/pair_*_seating_*_endpoints.json")):
@@ -120,14 +122,22 @@ def prepare_jobs(connection, source, root, settings):
             count = max(summary.get("endpoint_conformers", 1), max(available, default=1))
             inputs.extend((role, conformer, descriptor.parent / role / f"{prefix}_conformer_{conformer:03d}_input.xyz")
                           for conformer in range(1, count + 1))
-        inputs.append(("TS", 0, descriptor.parent / "ts_guess" / f"{prefix}.xyz"))
+        candidates = selection.get("candidates", [])
+        for candidate in candidates:
+            rank = candidate["rank"]
+            inputs.append(("TS", rank, descriptor.parent / "ts_guess" / f"{prefix}_conformer_{rank:03d}.xyz"))
+        if not candidates or settings["neb_fallback"]:
+            inputs.append(("TS", 0, descriptor.parent / "ts_guess" / f"{prefix}.xyz"))
         for role, conformer, source_xyz in inputs:
+            ts_selection = next((c for c in candidates if c["rank"] == conformer), selection)
+            ts_strategy = ("direct" if conformer else "neb") if role == "TS" and candidates else None
+            ts_rmsd = ts_selection.get("selected_ts_rmsd") if role == "TS" else None
             smiles = graphs["reactant" if role == "TS" else role]
             mol = mapped_molecule(smiles)
             error, xyz = None, None
             try:
-                if role == "TS" and ("ts_input" not in selection or selection.get("error")):
-                    raise ValueError(selection.get("error") or "No completed TS guess")
+                if role == "TS" and ("ts_input" not in ts_selection or ts_selection.get("error")):
+                    raise ValueError(ts_selection.get("error") or "No completed TS guess")
                 xyz = source_xyz.read_text()
                 molecule_with_xyz(smiles, xyz)
             except (ValueError, OSError) as exc:
@@ -136,12 +146,13 @@ def prepare_jobs(connection, source, root, settings):
                 xyz = None
             folder = root / descriptor.parent.name / ("ts_guess" if role == "TS" else role)
             folder.mkdir(parents=True, exist_ok=True)
-            target = folder / (f"{prefix}_input.xyz" if role == "TS" else source_xyz.name)
+            target = folder / (f"{source_xyz.stem}_input.xyz" if role == "TS" else source_xyz.name)
             key = (ligand_id, pair, seating, role, conformer)
             previous = connection.execute("SELECT * FROM jobs WHERE ligand_id=? AND pair_index=? AND seating=? "
                                           "AND endpoint=? AND conformer=?", key).fetchone()
             protocol = json.dumps(settings, sort_keys=True)
-            if previous and (previous["settings_json"] != protocol or previous["smiles"] != smiles):
+            if previous and ({key: value for key, value in json.loads(previous["settings_json"]).items()
+                              if key != "max_iterations"} != settings or previous["smiles"] != smiles):
                 raise ValueError("Existing jobs have different chemistry/settings; use a new HPC results directory")
             if previous and any(previous[name] is not None and previous[name] != value
                                 for name, value in metadata.items()):
@@ -151,35 +162,45 @@ def prepare_jobs(connection, source, root, settings):
                     raise ValueError(f"Existing input differs: {target}")
             elif xyz is not None:
                 target.write_text(xyz)
-            atoms = selection.get("ts_mode", {})
+            atoms = ts_selection.get("ts_mode", {})
             cursor = connection.execute("""INSERT OR IGNORE INTO jobs
                 (ligand_id,pair_index,seating,endpoint,conformer,input_xyz,smiles,charge,multiplicity,
                  donor,hydrogen,acceptor,settings_json,substrate,binding_mode,coordination_isomer,
-                 donor_maps,substrate_site,resonance,binding_permutation,status,stage,error,retained)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 donor_maps,substrate_site,resonance,binding_permutation,status,stage,error,retained,ts_rmsd,ts_strategy)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (*key, str(target.relative_to(root)), smiles, Chem.GetFormalCharge(mol), 1,
                  atoms.get("donor"), atoms.get("hydrogen"), atoms.get("acceptor"), protocol, *metadata.values(),
-                 "failed" if error else "pending", "sampling" if error else "opt", error, 0 if error else None))
+                 "failed" if error else "pending", "sampling" if error else ("neb" if ts_strategy == "neb" else "opt"),
+                 error, 0 if error else None, ts_rmsd, ts_strategy))
             added += cursor.rowcount
             if previous and any(previous[name] != value for name, value in metadata.items()):
                 update_job(connection, previous["id"], **metadata)
             if previous and previous["status"] == "failed" and previous["stage"] == "sampling":
                 update_job(connection, previous["id"], status="failed" if error else "pending",
                            stage="sampling" if error else "opt", error=error, retained=0 if error else None,
-                           donor=atoms.get("donor"), hydrogen=atoms.get("hydrogen"), acceptor=atoms.get("acceptor"))
+                           donor=atoms.get("donor"), hydrogen=atoms.get("hydrogen"), acceptor=atoms.get("acceptor"),
+                           ts_rmsd=ts_rmsd, ts_strategy=ts_strategy)
         groups += 1
     return added, groups
 
 
 def claim_job(connection):
-    """Atomically claim a conformer; a TS waits until its endpoint jobs have finished."""
+    """Claim ready jobs; NEB waits for all TS candidates and runs only if none succeeded."""
     connection.execute("BEGIN IMMEDIATE")
     try:
+        connection.execute("""UPDATE jobs AS j SET status='skipped',stage='complete',retained=0,
+            updated_at=CURRENT_TIMESTAMP WHERE j.status='pending' AND j.ts_strategy='neb'
+            AND EXISTS (SELECT 1 FROM jobs t WHERE t.ligand_id=j.ligand_id AND t.pair_index=j.pair_index
+              AND t.seating=j.seating AND t.endpoint='TS' AND t.status='succeeded')""")
         job = connection.execute("""UPDATE jobs SET status='running',attempt=attempt+1,error=NULL,
             worker_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=(
               SELECT j.id FROM jobs j WHERE j.status='pending' AND (j.endpoint!='TS' OR NOT EXISTS (
                 SELECT 1 FROM jobs e WHERE e.ligand_id=j.ligand_id AND e.pair_index=j.pair_index
                   AND e.seating=j.seating AND e.endpoint!='TS' AND e.status IN ('pending','running')))
+              AND (coalesce(j.ts_strategy,'')!='neb' OR NOT EXISTS (
+                SELECT 1 FROM jobs t WHERE t.ligand_id=j.ligand_id AND t.pair_index=j.pair_index
+                  AND t.seating=j.seating AND t.endpoint='TS' AND t.ts_strategy='direct'
+                  AND t.status IN ('pending','running')))
               ORDER BY (j.endpoint='TS'),j.id LIMIT 1) RETURNING *""",
             (os.environ.get("SLURM_JOB_ID", "local") + f":{os.getpid()}",)).fetchone()
         connection.commit()
@@ -230,10 +251,12 @@ def run_job(connection, job, root, executables):
             if any(changes.values()):
                 raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
         else:
-            result = calculate("optts", 1)
+            result = {"converged": False, "xyz": None} if job.get("ts_strategy") == "neb" else calculate("optts", 1)
+            if job.get("ts_strategy") == "direct" and (not result["converged"] or not result["xyz"]):
+                raise RuntimeError("Direct OptTS candidate did not converge")
             if result["converged"] and result["xyz"]:
                 current = result["xyz"]
-            else:
+            elif job.get("ts_strategy") != "neb":
                 # Relax the original guess, not the failed direct OptTS geometry.
                 current = original
                 result = calculate("relax", 1)
@@ -278,9 +301,9 @@ def run_job(connection, job, root, executables):
         update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
         result = calculate("freq")
         if job["endpoint"] != "TS" and result["imaginary_count"] > 0:
-            tight = calculate("tightopt")
+            tight = calculate("verytightopt")
             if not tight["converged"] or not tight["xyz"]:
-                raise RuntimeError("ORCA TightOpt retry did not converge")
+                raise RuntimeError("ORCA VeryTightOpt retry did not converge")
             current = tight["xyz"]
             changes = connectivity_changes(molecule_with_xyz(job["smiles"], current),
                                            molecule_with_xyz(job["smiles"], original))
@@ -300,6 +323,13 @@ def run_job(connection, job, root, executables):
             update_job(connection, job["id"], status="succeeded", stage="complete", retained=1)
             if job["endpoint"] != "TS":
                 select_endpoints(connection, job)
+            else:
+                group = (job["ligand_id"], job["pair_index"], job["seating"])
+                connection.execute("""UPDATE jobs SET retained=(id=(SELECT id FROM jobs
+                    WHERE ligand_id=? AND pair_index=? AND seating=? AND endpoint='TS' AND status='succeeded'
+                    ORDER BY gibbs_free_energy_eh,id LIMIT 1)),updated_at=CURRENT_TIMESTAMP
+                    WHERE ligand_id=? AND pair_index=? AND seating=? AND endpoint='TS' AND status='succeeded'""",
+                    (*group, *group))
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -368,8 +398,9 @@ def main(argv=None):
     root = (base / config["paths"]["results"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     settings = config["calculation"]
+    settings.pop("max_iterations", None)  # Ignore the removed override in older config files.
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
-    for key in ("cpus", "memory_mb", "max_iterations", "opt_attempts", "ts_attempts", "timeout_seconds"):
+    for key in ("cpus", "memory_mb", "opt_attempts", "ts_attempts", "timeout_seconds"):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
     executables = {}
@@ -400,7 +431,7 @@ def main(argv=None):
             rows = [rows[args.ligand_index]]
         sampling = config.get("sampling", {})
         if any(sampling.get(key, default) < 1 for key, default in (
-            ("endpoint_conformers", 3), ("coembed_conformers", 10))):
+            ("endpoint_conformers", 3), ("coembed_conformers", 10), ("ts_candidates", 5))):
             parser.error("Sampling conformer counts must be positive")
         source = (base / config["paths"]["source"]).resolve()
         for row in rows:
