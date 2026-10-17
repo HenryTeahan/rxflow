@@ -19,7 +19,6 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 from rdkit import Chem
-from rdkit.Chem import rdMolAlign
 
 from orca_hpc import molecule_with_xyz, run_orca
 from rxflow import HARTREE_TO_KCAL, SUBSTRATE, ligand_directory, read_ligands
@@ -81,6 +80,18 @@ def prepare_jobs(connection, source, root, settings):
                 pair_tables[descriptor.parent] = list(csv.DictReader(handle))
         reaction = pair_tables[descriptor.parent][pair - 1]
         graphs = json.loads(descriptor.read_text())
+        # Preserve the selected coembedded endpoint pair for a possible NEB fallback.
+        for role in ("reactant", "product"):
+            reactive = descriptor.parent / role / f"{prefix}_reactive.xyz"
+            if reactive.exists():
+                xyz = reactive.read_text()
+                molecule_with_xyz(graphs[role], xyz)
+                target = root / descriptor.parent.name / role / reactive.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists() and target.read_text() != xyz:
+                    raise ValueError(f"Existing coembedded input differs: {target}")
+                if not target.exists():
+                    target.write_text(xyz)
         summary_path = descriptor.parent / "sampling.json"
         summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
         errors = [e for e in summary.get("errors", []) if e.get("pair") == pair and e.get("seating") == seating]
@@ -226,20 +237,21 @@ def run_job(connection, job, root, executables):
                 if not settings["neb_fallback"]:
                     raise RuntimeError("OptTS attempts did not converge")
                 endpoints = []
-                reference = molecule_with_xyz(job["smiles"], current)
-                fit = [(a.GetIdx(), a.GetIdx()) for a in reference.GetAtoms()
-                       if a.GetAtomicNum() > 1 and a.GetIdx() not in (job["donor"], job["acceptor"])]
+                ts_folder = Path(job["input_xyz"]).parent
+                prefix = Path(job["input_xyz"]).name.removesuffix("_input.xyz")
                 for role in ("reactant", "product"):
-                    row = connection.execute("""SELECT * FROM jobs WHERE ligand_id=? AND pair_index=? AND seating=?
-                        AND endpoint=? AND status='succeeded' AND retained=1 ORDER BY electronic_energy_eh LIMIT 1""",
+                    path = root / ts_folder.parent / role / f"{prefix}_reactive.xyz"
+                    xyz = path.read_text()
+                    endpoint = connection.execute("""SELECT smiles FROM jobs WHERE ligand_id=? AND pair_index=?
+                        AND seating=? AND endpoint=? LIMIT 1""",
                         (job["ligand_id"], job["pair_index"], job["seating"], role)).fetchone()
-                    if row is None:
-                        raise ValueError(f"NEB has no valid optimized {role}")
-                    mol = molecule_with_xyz(row["smiles"], (root / row["xyz_file"]).read_text())
-                    if len(fit) < 3:
-                        raise ValueError("NEB alignment requires three spectator heavy atoms")
-                    rdMolAlign.AlignMol(mol, reference, atomMap=fit)
-                    endpoints.append(Chem.MolToXYZBlock(mol))
+                    if endpoint is None:
+                        raise ValueError(f"NEB has no sampled {role} graph")
+                    molecule_with_xyz(endpoint["smiles"], xyz)
+                    endpoints.append(xyz)
+                # NEB uses the original rxts TS guess and its coembedded endpoint pair.
+                molecule_with_xyz(job["smiles"], original)
+                current = original
                 result = calculate("neb", endpoints=endpoints)
                 if not result["converged"] or not result["xyz"]:
                     raise RuntimeError("NEB-TS fallback did not converge")

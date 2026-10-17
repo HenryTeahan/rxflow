@@ -228,7 +228,8 @@ within 3 kcal/mol of the lowest electronic energy. Minima require zero imaginary
 frequencies. A TS waits for its endpoint jobs, constrains the transferring H and
 its donor/acceptor during relaxation, tries OptTS twice, and uses NEB-TS if both
 attempts fail. Separate NumFreq must then give exactly one imaginary frequency.
-NEB uses the lowest valid optimized endpoint on each side.
+NEB uses the original coembedded reactant and product geometries with the rxts
+TS guess, preserving their shared atom mapping and alignment.
 
 All ORCA stages use `oet_gxtb_alpb -e XTB_EXE -s h2o`: gas-phase g-xTB plus the
 GFN2(ALPB water) minus GFN2(gas) correction. Gibbs energies come exclusively from
