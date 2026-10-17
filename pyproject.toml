@@ -1,0 +1,21 @@
+[project]
+name = "rxflow"
+version = "0.1.0"
+description = "Local transition-metal reaction workflow"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "rxembed[workflow]",
+    "rxts[ff]",
+    "ipykernel",
+    "jupyterlab",
+    "nbformat",
+]
+
+[tool.uv]
+package = false
+# rxts declares a GitHub URL; use the sibling checkout for that dependency too.
+override-dependencies = ["rxembed"]
+
+[tool.uv.sources]
+rxembed = { path = "../rxembed", editable = true }
+rxts = { path = "../rxts", editable = true }

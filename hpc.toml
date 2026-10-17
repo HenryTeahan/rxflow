@@ -1,0 +1,17 @@
+[paths]
+source = "results"
+results = "hpc_results"
+
+[executables]
+orca_exe = "${ORCA_EXE}"
+external_exe = "${OET_GXTB_ALPB_EXE}"
+xtb_exe = "${XTB_EXE}"
+
+[calculation]
+solvent = "h2o"
+cpus = 1
+memory_mb = 2000
+max_iterations = 100
+ts_attempts = 2
+neb_fallback = true
+timeout_seconds = 86400
