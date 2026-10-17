@@ -18,6 +18,7 @@ solvent = "h2o"
 cpus = 1
 memory_mb = 2000
 max_iterations = 100
+opt_attempts = 2
 ts_attempts = 2
 neb_fallback = true
 timeout_seconds = 86400

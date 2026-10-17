@@ -202,6 +202,7 @@ def select_endpoints(connection, job):
 def run_job(connection, job, root, executables):
     """Optimize an endpoint or relax/refine a TS, then collect a separate ORCA NumFreq."""
     settings = {**json.loads(job["settings_json"]), **executables}
+    settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
 
     def calculate(stage, attempt=1, endpoints=None):
         update_job(connection, job["id"], stage=stage)
@@ -215,7 +216,12 @@ def run_job(connection, job, root, executables):
         original = (root / job["input_xyz"]).read_text()
         current = original
         if job["endpoint"] != "TS":
-            result = calculate("opt")
+            result = calculate("opt", 1)
+            for attempt in range(2, settings["opt_attempts"] + 1):
+                if result["converged"] or not result.get("max_cycles_reached") or not result.get("xyz"):
+                    break
+                current = result["xyz"]
+                result = calculate("opt", attempt)
             if not result["converged"] or not result["xyz"]:
                 raise RuntimeError("ORCA endpoint optimization did not converge")
             current = result["xyz"]
@@ -224,7 +230,12 @@ def run_job(connection, job, root, executables):
             if any(changes.values()):
                 raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
         else:
-            result = calculate("relax")
+            result = calculate("relax", 1)
+            for attempt in range(2, settings["ts_attempts"] + 1):
+                if result["converged"] or not result.get("max_cycles_reached") or not result.get("xyz"):
+                    break
+                current = result["xyz"]
+                result = calculate("relax", attempt)
             if not result["converged"] or not result["xyz"]:
                 raise RuntimeError("Constrained TS relaxation did not converge")
             current = result["xyz"]
@@ -260,6 +271,18 @@ def run_job(connection, job, root, executables):
         path.write_text(current)
         update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
         result = calculate("freq")
+        if job["endpoint"] != "TS" and result["imaginary_count"] > 0:
+            tight = calculate("tightopt")
+            if not tight["converged"] or not tight["xyz"]:
+                raise RuntimeError("ORCA TightOpt retry did not converge")
+            current = tight["xyz"]
+            changes = connectivity_changes(molecule_with_xyz(job["smiles"], current),
+                                           molecule_with_xyz(job["smiles"], original))
+            if any(changes.values()):
+                raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
+            path.write_text(current)
+            update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
+            result = calculate("freq", 2)
         update_job(connection, job["id"], electronic_energy_eh=result["electronic_energy_eh"],
                    gibbs_free_energy_eh=result["gibbs_free_energy_eh"], imaginary_count=result["imaginary_count"],
                    frequencies_json=json.dumps(result["frequencies"]))
@@ -329,7 +352,8 @@ def main(argv=None):
     root = (base / config["paths"]["results"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     settings = config["calculation"]
-    for key in ("cpus", "memory_mb", "max_iterations", "ts_attempts", "timeout_seconds"):
+    settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
+    for key in ("cpus", "memory_mb", "max_iterations", "opt_attempts", "ts_attempts", "timeout_seconds"):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
     executables = {}

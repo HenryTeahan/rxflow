@@ -44,11 +44,12 @@ def orca_input(xyz, stage, charge, multiplicity, settings, atoms=()):
     external = settings["external_exe"]
     if any(c in external + parameters for c in ('"', '\n', '\r')):
         raise ValueError("ORCA external paths/parameters contain quote or newline delimiters")
-    keyword = {"opt": "Opt", "relax": "Opt", "optts": "OptTS", "neb": "NEB-TS", "freq": "NumFreq"}[stage]
+    keyword = {"opt": "Opt", "tightopt": "TightOpt", "relax": "Opt", "optts": "OptTS",
+               "neb": "NEB-TS", "freq": "NumFreq"}[stage]
     header = (f"! ExtOpt {keyword}\n%pal nprocs {settings['cpus']} end\n"
               f"%maxcore {int(settings['memory_mb'] * 0.75 / settings['cpus'])}\n"
               f'%method\n ProgExt "{external}"\n Ext_Params "{parameters}"\nend\n')
-    if stage in ("opt", "relax", "optts"):
+    if stage in ("opt", "tightopt", "relax", "optts"):
         header += f"%geom\n MaxIter {settings['max_iterations']}\n"
         if stage == "relax":
             header += " Constraints\n" + "".join(f"  {{C {i} C}}\n" for i in atoms) + " end\n"
@@ -131,6 +132,10 @@ def run_orca(job, root, settings, stage, xyz, *, attempt=1, neb_endpoints=None):
             normal = code == 0 and "ORCA TERMINATED NORMALLY" in text
             result.update(normal=normal, converged=normal and (
                 "THE OPTIMIZATION HAS CONVERGED" in text.upper() or "OPTIMIZATION CONVERGED" in text.upper()))
+            result["max_cycles_reached"] = (
+                "THE OPTIMIZATION DID NOT CONVERGE BUT REACHED THE MAXIMUM NUMBER OF" in text.upper()
+                and "OPTIMIZATION CYCLES" in text.upper()
+            )
             energies = ENERGY.findall(text)
             energy = float(energies[-1].replace("D", "E").replace("d", "e")) if energies else None
             result["electronic_energy_eh"] = energy if energy is not None and math.isfinite(energy) else None
