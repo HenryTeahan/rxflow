@@ -1,0 +1,12 @@
+*.ipynb
+tests/
+results/
+__pycache__/
+.venv/
+inspiration/
+hpc_results/
+hpc_seeds/
+orca-*.out
+sampling-*.out
+build/
+*.egg-info/

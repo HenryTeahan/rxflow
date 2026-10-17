@@ -1,11 +1,17 @@
 [paths]
-source = "results"
+ligands_csv = "ligands.csv"
+source = "hpc_seeds"
 results = "hpc_results"
 
 [executables]
 orca_exe = "${ORCA_EXE}"
-external_exe = "${OET_GXTB_ALPB_EXE}"
+external_exe = "${ORCA_EXTERNAL_TOOLS}"
 xtb_exe = "${XTB_EXE}"
+
+[sampling]
+endpoint_conformers = 3
+coembed_conformers = 10
+seed = 12345
 
 [calculation]
 solvent = "h2o"

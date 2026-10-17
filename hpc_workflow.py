@@ -8,8 +8,11 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import sqlite3
+import subprocess
+import sys
 import tomllib
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -19,7 +22,7 @@ from rdkit import Chem
 from rdkit.Chem import rdMolAlign
 
 from orca_hpc import molecule_with_xyz, run_orca
-from rxflow import HARTREE_TO_KCAL, SUBSTRATE
+from rxflow import HARTREE_TO_KCAL, SUBSTRATE, ligand_directory, read_ligands
 from rxflow_endpoints import connectivity_changes, mapped_molecule
 
 
@@ -248,11 +251,49 @@ def run_job(connection, job, root, executables):
         print(f"Job {job['id']} ({job['endpoint']}): {exc}", flush=True)
 
 
+def submit_workflow(config_path, config, *, workers=100, account=None, partition=None):
+    """Submit sampling, preparation, then ORCA; each stage waits for the preceding stage."""
+    base = config_path.resolve().parent
+    rows = read_ligands(base / config["paths"]["ligands_csv"])
+    if not rows or workers < 1:
+        raise ValueError("At least one CSV row and one worker are required")
+    source = base / config["paths"]["source"]
+    root = base / config["paths"]["results"]
+    if (source.exists() and any(source.iterdir())) or (root / "workflow.sqlite").exists():
+        raise ValueError("Choose fresh source/results directories for submit; use worker to resume prepared jobs")
+    command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve())])
+    wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
+    common = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL",
+              f"--mem={config['calculation']['memory_mb']}", "--time=24:00:00"]
+    for flag, value in (("account", account), ("partition", partition)):
+        if value:
+            common.append(f"--{flag}={value}")
+
+    def submit(name, stage, *, cpus=1, dependency=None, array=None):
+        args = [*common, f"--job-name=rxflow-{name}", f"--cpus-per-task={cpus}",
+                f"--output={base / (name + '-%A_%a.out')}"]
+        if dependency:
+            args.append(f"--dependency=afterok:{dependency}")
+        if array:
+            args.append(f"--array={array}")
+        return subprocess.check_output([*args, "--wrap", wrap + " " + stage], text=True).strip().split(";")[0]
+
+    sampling = submit("sampling", 'sample --ligand-index "$SLURM_ARRAY_TASK_ID"', array=f"0-{len(rows) - 1}")
+    prepared = submit("prepare", "prepare", dependency=sampling)
+    orca = submit("orca", "worker", cpus=config["calculation"]["cpus"],
+                  dependency=prepared, array=f"0-{workers - 1}%{workers}")
+    return dict(sampling=sampling, prepare=prepared, orca=orca)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("hpc.toml"))
-    parser.add_argument("command", choices=("prepare", "worker", "status", "retry"))
+    parser.add_argument("command", choices=("submit", "sample", "prepare", "worker", "status", "retry"))
     parser.add_argument("--id", type=int, help="Specific stopped/failed row to retry")
+    parser.add_argument("--ligand-index", type=int, help="Zero-based CSV row for a sampling array task")
+    parser.add_argument("--workers", type=int, default=100, help="ORCA workers for submit (default 100)")
+    parser.add_argument("--account", help="Slurm account for submit")
+    parser.add_argument("--partition", help="Slurm partition for submit")
     args = parser.parse_args(argv)
     config = tomllib.loads(args.config.read_text())
     base = args.config.resolve().parent
@@ -262,18 +303,46 @@ def main(argv=None):
     for key in ("cpus", "memory_mb", "max_iterations", "ts_attempts", "timeout_seconds"):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
+    executables = {}
+    if args.command in ("submit", "sample", "worker"):
+        keys = ("xtb_exe",) if args.command == "sample" else ("orca_exe", "external_exe", "xtb_exe")
+        for key in keys:
+            value = os.path.expanduser(os.path.expandvars(config["executables"][key]))
+            executable = shutil.which(value if not value.startswith(".") else str(base / value))
+            if not executable:
+                parser.error(f"Executable {key} not found: {value!r}; set it in {args.config} or its environment variable")
+            executables[key] = str(Path(executable).resolve())
+    if args.command == "submit":
+        if not shutil.which("sbatch"):
+            parser.error("submit requires Slurm's sbatch command")
+        try:
+            print(submit_workflow(args.config, config, workers=args.workers,
+                                  account=args.account, partition=args.partition))
+        except (ValueError, subprocess.CalledProcessError) as exc:
+            parser.error(str(exc))
+        return
+    if args.command == "sample":
+        from hpc_sampling import sample_ligand
+
+        rows = read_ligands(base / config["paths"]["ligands_csv"])
+        if args.ligand_index is not None:
+            if not 0 <= args.ligand_index < len(rows):
+                parser.error("--ligand-index is outside the CSV row range")
+            rows = [rows[args.ligand_index]]
+        sampling = config.get("sampling", {})
+        if any(sampling.get(key, default) < 1 for key, default in (
+            ("endpoint_conformers", 3), ("coembed_conformers", 10))):
+            parser.error("Sampling conformer counts must be positive")
+        source = (base / config["paths"]["source"]).resolve()
+        for row in rows:
+            print(sample_ligand(row, ligand_directory(source, row["ID"]), executables["xtb_exe"], **sampling), flush=True)
+        return
     connection = connect_database(root / "workflow.sqlite")
     try:
         if args.command == "prepare":
             print("New jobs, ready reaction/seating groups:", prepare_jobs(connection,
                 (base / config["paths"]["source"]).resolve(), root, settings))
         elif args.command == "worker":
-            executables = {}
-            for key, value in config["executables"].items():
-                executable = shutil.which(os.path.expandvars(value))
-                if not executable:
-                    parser.error(f"Set {key} in {args.config} or its environment variable")
-                executables[key] = str(Path(executable).resolve())
             while (job := claim_job(connection)) is not None:
                 print(f"Job {job['id']}: ligand {job['ligand_id']} {job['endpoint']}", flush=True)
                 run_job(connection, job, root, executables)

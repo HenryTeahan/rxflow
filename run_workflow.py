@@ -10,7 +10,6 @@ import logging
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -18,7 +17,7 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
 import rxembed
 
-from rxflow import generate_reaction_pairs, ligand_directory, read_ligands
+from rxflow import generate_reaction_pairs, ligand_directory, read_ligands, rxembed_revision
 from rxflow_endpoints import sample_reaction_endpoints
 
 
@@ -88,8 +87,7 @@ def main(argv=None):
     output.mkdir(parents=True, exist_ok=True)
     if (output / "run.json").exists() or any(output.glob("ligand_*")):
         parser.error(f"A workflow already exists in {output}; choose an empty output directory")
-    checkout = Path(rxembed.__file__).resolve().parents[2]
-    revision = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+    revision = rxembed_revision()
     run = {"status": "running", "pid": os.getpid(), "python": sys.executable,
            "rxembed_source": rxembed.__file__, "rxembed_commit": revision,
            "ligands": len(rows), "workers": workers, "threads_per_worker": 1,

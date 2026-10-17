@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "rxflow"
 version = "0.1.0"
-description = "Local transition-metal reaction workflow"
+description = "Transition-metal reaction sampling and ORCA HPC workflow"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "rxembed[workflow]",
@@ -11,11 +15,16 @@ dependencies = [
     "nbformat",
 ]
 
+[project.scripts]
+rxflow = "hpc_workflow:main"
+
+[tool.setuptools]
+py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "orca_hpc", "run_workflow"]
+
 [tool.uv]
-package = false
-# rxts declares a GitHub URL; use the sibling checkout for that dependency too.
+# Apply the PR #28 pin to rxts's transitive rxembed requirement too.
 override-dependencies = ["rxembed"]
 
 [tool.uv.sources]
-rxembed = { path = "../rxembed", editable = true }
-rxts = { path = "../rxts", editable = true }
+rxembed = { git = "https://github.com/aligfellow/rxembed.git", rev = "2c60b21f0eb0aebb5361bae2a968050b616c4dd9" }
+rxts = { git = "https://github.com/HenryTeahan/rxts.git", rev = "8eac9f1b2a2d13e52b47a1438961e0fe68a45f47" }

@@ -2,15 +2,33 @@
 
 A small transition-metal reaction workflow using `ligands.csv`, `rxembed` and `rxts`.
 
-The isolated environment is `.venv` (Python 3.13). `uv sync --locked` installs the
-locked dependencies and editable sibling `../rxembed` / `../rxts` checkouts.
+Clone rxflow and install it into `.venv` (Python 3.13):
+
+```sh
+git clone https://github.com/HenryTeahan/rxflow.git
+cd rxflow
+uv sync --locked
+source .venv/bin/activate
+rxflow --help
+```
+
+`uv sync --locked` installs rxflow and all Python dependencies, including GitHub
+`rxembed` and `rxts`; no sibling checkouts are needed. `rxembed` is pinned to
+[PR #28](https://github.com/aligfellow/rxembed/pull/28), commit
+`2c60b21f0eb0aebb5361bae2a968050b616c4dd9`. `rxts` uses
+[HenryTeahan/rxts](https://github.com/HenryTeahan/rxts), pinned to
+`8eac9f1b2a2d13e52b47a1438961e0fe68a45f47`, containing molecule-input and GFN-FF
+graph-topology fixes, without rotation search. Git dependencies use HTTPS so
+installation needs no SSH credentials. Use the project install above so uv
+applies the same rxembed pin to rxts's transitive dependency. GFN-FF's source
+build requires a Fortran compiler and BLAS/LAPACK on the cluster.
 
 ```sh
 source .venv/bin/activate
 jupyter lab manual_workflow.ipynb
 ```
 
-Select **Python (rxflow)**. The notebook checks its interpreter, prints the local
+Select **Python (rxflow)**. The notebook checks its interpreter, prints the installed
 coembedding source and revision, and uses one ligand. Screening results are reused
 when present. Minimum optimization uses three conformers;
 coembedding requests **10 pairs and selects the lowest TS RMSD pair** for one TS guess.
@@ -112,36 +130,64 @@ The original `reaction_workflow.py` is a reference requiring the absent
 
 ## HPC / ORCA
 
-`hpc_workflow.py` adds a separate ORCA worker, using the existing local sampling
-as its starting point. It imports the three initial conformers per endpoint and
-the selected coembedding/rxts TS guess; it does not import local energies or run
-the local optimizer on the HPC. Preparation can be repeated as more local guesses
-finish, without resetting existing jobs.
+The installed `rxflow` command provides separate HPC sampling and ORCA stages.
+Set `paths.ligands_csv`, `paths.source` (default `hpc_seeds`) and `paths.results`
+(default `hpc_results`) in `hpc.toml`. Use fresh directories to start a new run.
+Sampling begins with the CSV, screens coordination modes with gas-phase g-xTB
+and the 20 kcal/mol cutoff, embeds three initial conformers per endpoint, and
+creates one rxts TS guess from the best of ten coembedded pairs. It does not run
+gas-phase endpoint optimization. Those endpoints are optimized by ORCA later.
+
+Supply all external executable paths yourself. `ORCA_EXTERNAL_TOOLS` is the full
+path to the **oet_gxtb_alpb executable**, wherever it is installed (including opt).
+No installation directory is assumed and no separate wrapper installation in
+rxflow's environment is required when your executable already works.
 
 ```sh
-.venv/bin/python hpc_workflow.py prepare
-.venv/bin/python hpc_workflow.py status
+export ORCA_EXE=/your/path/to/orca
+export XTB_EXE=/your/path/to/gxtb-enabled/xtb
+export ORCA_EXTERNAL_TOOLS=/your/path/to/oet_gxtb_alpb
 ```
 
-Configure paths and calculation settings in `hpc.toml`. Copy the code and entire
-`hpc_results/` directory to the cluster, install the Python environment, and load
-the cluster's ORCA/MPI modules. The prepared database no longer needs `results/`.
-The current `uv.lock` also needs the sibling `rxembed` and `rxts` checkouts.
+Load your cluster's ORCA/MPI modules before submitting, then start from the CSV:
+
+```sh
+rxflow submit --account YOUR_ACCOUNT --partition YOUR_PARTITION
+```
+
+Omit account/partition options when your cluster supplies defaults. `submit`
+determines the sampling array size from the CSV, runs one CPU per ligand, then
+submits database preparation and the ORCA worker array with `afterok` dependencies.
+It prints all three Slurm job IDs and exports the current environment to every job.
+Existing runs are protected: choose fresh source/results paths to start again.
+
+The default is 100 independent ORCA workers (`--workers 100`), one CPU and 2 GB
+RAM per worker as configured in `hpc.toml`, with a 24-hour Slurm time limit per
+stage. Sampling failures hold downstream jobs; inspect `sampling-*.out` and each
+ligand's `sampling.json`. ORCA logs are `orca-*.out` beside the config file.
+Scratch uses Python's temporary directory (`TMPDIR`); set it to node-local storage
+as required by your cluster. Use the cluster's shared filesystem for the database.
+
+`hpc_sample.sbatch` and `hpc_worker.sbatch` remain available for manual submission;
+the sample template's `0-12` range matches the supplied 13-row CSV. Those templates
+can load cluster-specific modules when that is needed inside the batch job.
+
+The stages are also available individually, for a compute-node allocation:
+
+```sh
+rxflow sample --ligand-index 0   # Zero-based CSV row; omit to sample all sequentially.
+rxflow prepare
+rxflow worker
+rxflow status
+```
+
+To reuse previously sampled local results instead, set `paths.source = "results"`
+and run `rxflow prepare`, then submit only the ORCA worker array. Preparation
+imports initial endpoint XYZs and selected TS guesses, never local energies or
+old ORCA inputs. It is repeatable without resetting existing jobs. After
+preparation, only the full `hpc_results/` directory is needed, not the seed source.
 Calculation settings are frozen per row during preparation; use a new results
-directory when changing the protocol.
-Set the actual executable paths, then submit from the project directory:
-
-```sh
-export ORCA_EXE=/path/to/orca
-export OET_GXTB_ALPB_EXE=/path/to/oet_gxtb_alpb
-export XTB_EXE=/path/to/xtb
-sbatch hpc_worker.sbatch
-```
-
-The example array runs up to 100 independent one-core workers. Match its memory,
-CPU and time requests to `hpc.toml` when changing them. Scratch uses Python's
-temporary directory (`TMPDIR` on clusters); set it to node-local storage.
-The existing local runner and notebook remain unchanged.
+directory when changing the protocol. The local runner remains separate.
 
 Each worker atomically claims a row in `hpc_results/workflow.sqlite`. Its single
 `jobs` table holds one row per endpoint conformer and one TS per ligand/pair/seating,
@@ -191,12 +237,13 @@ Failed rows are left for inspection. After stopping any previous worker for a
 row, retry explicitly; attempt-specific filenames preserve earlier artifacts:
 
 ```sh
-.venv/bin/python hpc_workflow.py retry --id 42
-.venv/bin/python hpc_workflow.py worker
+rxflow retry --id 42
+rxflow worker
 ```
 
 ORCA is not installed locally. Tests exercise input/output parsing, subprocess
-artifact handling, queue claims, endpoint selection and TS fallback with mocks;
+artifact handling, queue claims, endpoint selection, TS fallback and Slurm job
+dependencies with mocks;
 the first real ORCA calculation still needs validation on the cluster.
 
 ```sh

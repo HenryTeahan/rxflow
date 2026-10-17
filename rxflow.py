@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import tempfile
 from itertools import combinations
+from importlib.metadata import distribution
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -27,6 +28,18 @@ LOG = logging.getLogger(__name__)
 HARTREE_TO_KCAL = 627.5094740631
 SUBSTRATE = "[H]C1=CC(OC)=C(OC)C(OC)=C1"
 ENERGY = re.compile(r"TOTAL ENERGY\s+([-+\d.eEdD]+)\s+Eh")
+
+
+def rxembed_revision():
+    """Report the installed Git revision, including non-editable Git installations."""
+    metadata = json.loads(distribution("rxembed").read_text("direct_url.json") or "{}")
+    if metadata.get("vcs_info", {}).get("commit_id"):
+        return metadata["vcs_info"]["commit_id"]
+    import rxembed
+
+    checkout = Path(rxembed.__file__).resolve().parents[2]
+    result = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True)
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def read_ligands(path):
