@@ -162,6 +162,19 @@ tasks; the ORCA worker array waits for successful preparation (`afterok`).
 It prints all three Slurm job IDs and exports the current environment to every job.
 Existing runs are protected: choose fresh source/results paths to start again.
 
+To resume pending jobs in an existing database, including jobs reset with `retry`,
+submit only the ORCA worker array:
+
+```sh
+rxflow resume --workers 100 --account YOUR_ACCOUNT --partition YOUR_PARTITION
+```
+
+Omit account/partition when supplied by cluster defaults. Use `--config other.toml`
+for another database. This skips sampling and preparation and leaves succeeded,
+failed and running rows unchanged; workers claim only pending rows. Failed rows
+must first be reset with `rxflow retry --id ID`. Rows left running by killed workers
+also require an explicit retry after the old workers have stopped.
+
 The default is 100 independent ORCA workers (`--workers 100`), one CPU and 2 GB
 RAM per worker as configured in `hpc.toml`, with a 24-hour Slurm time limit per
 stage. Endpoint embedding and TS-guess failures are recorded in each ligand's
@@ -247,7 +260,7 @@ earlier artifacts:
 
 ```sh
 rxflow retry --id 42
-rxflow worker
+rxflow resume --workers 100
 ```
 
 ORCA is not installed locally. Tests exercise input/output parsing, subprocess

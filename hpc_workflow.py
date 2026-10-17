@@ -303,16 +303,22 @@ def run_job(connection, job, root, executables):
         print(f"Job {job['id']} ({job['endpoint']}): {exc}", flush=True)
 
 
-def submit_workflow(config_path, config, *, workers=100, account=None, partition=None):
-    """Submit sampling, preparation, then ORCA; each stage waits for the preceding stage."""
+def submit_workflow(config_path, config, *, workers=100, account=None, partition=None, resume=False):
+    """Submit the full workflow, or only ORCA workers for an existing database."""
     base = config_path.resolve().parent
-    rows = read_ligands(base / config["paths"]["ligands_csv"])
-    if not rows or workers < 1:
-        raise ValueError("At least one CSV row and one worker are required")
-    source = base / config["paths"]["source"]
+    if workers < 1:
+        raise ValueError("At least one worker is required")
     root = base / config["paths"]["results"]
-    if (source.exists() and any(source.iterdir())) or (root / "workflow.sqlite").exists():
-        raise ValueError("Choose fresh source/results directories for submit; use worker to resume prepared jobs")
+    if resume:
+        if not (root / "workflow.sqlite").is_file():
+            raise ValueError("No prepared workflow database found; use submit for a new run")
+    else:
+        rows = read_ligands(base / config["paths"]["ligands_csv"])
+        if not rows:
+            raise ValueError("At least one CSV row is required")
+        source = base / config["paths"]["source"]
+        if (source.exists() and any(source.iterdir())) or (root / "workflow.sqlite").exists():
+            raise ValueError("Choose fresh source/results directories for submit; use resume for prepared jobs")
     command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve())])
     wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
     common = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL",
@@ -330,6 +336,10 @@ def submit_workflow(config_path, config, *, workers=100, account=None, partition
             args.append(f"--array={array}")
         return subprocess.check_output([*args, "--wrap", wrap + " " + stage], text=True).strip().split(";")[0]
 
+    if resume:
+        return dict(orca=submit("orca", "worker", cpus=config["calculation"]["cpus"],
+                                array=f"0-{workers - 1}%{workers}"))
+
     sampling = submit("sampling", 'sample --ligand-index "$SLURM_ARRAY_TASK_ID"', array=f"0-{len(rows) - 1}")
     prepared = submit("prepare", "prepare", dependency=sampling, dependency_type="afterany")
     orca = submit("orca", "worker", cpus=config["calculation"]["cpus"],
@@ -340,12 +350,12 @@ def submit_workflow(config_path, config, *, workers=100, account=None, partition
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("hpc.toml"))
-    parser.add_argument("command", choices=("submit", "sample", "prepare", "worker", "status", "retry"))
+    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry"))
     parser.add_argument("--id", type=int, help="Specific stopped/failed row to retry")
     parser.add_argument("--ligand-index", type=int, help="Zero-based CSV row for a sampling array task")
-    parser.add_argument("--workers", type=int, default=100, help="ORCA workers for submit (default 100)")
-    parser.add_argument("--account", help="Slurm account for submit")
-    parser.add_argument("--partition", help="Slurm partition for submit")
+    parser.add_argument("--workers", type=int, default=100, help="ORCA workers for submit/resume (default 100)")
+    parser.add_argument("--account", help="Slurm account for submit/resume")
+    parser.add_argument("--partition", help="Slurm partition for submit/resume")
     args = parser.parse_args(argv)
     config = tomllib.loads(args.config.read_text())
     base = args.config.resolve().parent
@@ -357,7 +367,7 @@ def main(argv=None):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
     executables = {}
-    if args.command in ("submit", "sample", "worker"):
+    if args.command in ("submit", "resume", "sample", "worker"):
         keys = ("xtb_exe",) if args.command == "sample" else ("orca_exe", "external_exe", "xtb_exe")
         for key in keys:
             value = os.path.expanduser(os.path.expandvars(config["executables"][key]))
@@ -365,12 +375,12 @@ def main(argv=None):
             if not executable:
                 parser.error(f"Executable {key} not found: {value!r}; set it in {args.config} or its environment variable")
             executables[key] = str(Path(executable).resolve())
-    if args.command == "submit":
+    if args.command in ("submit", "resume"):
         if not shutil.which("sbatch"):
-            parser.error("submit requires Slurm's sbatch command")
+            parser.error(f"{args.command} requires Slurm's sbatch command")
         try:
             print(submit_workflow(args.config, config, workers=args.workers,
-                                  account=args.account, partition=args.partition))
+                                  account=args.account, partition=args.partition, resume=args.command == "resume"))
         except (ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
         return
