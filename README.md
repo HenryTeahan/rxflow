@@ -250,26 +250,67 @@ within 3 kcal/mol of the lowest electronic energy. Minima require zero imaginary
 frequencies. If the first endpoint NumFreq finds any imaginary frequencies, run
 VeryTightOpt from that optimized geometry, check connectivity again, and repeat
 NumFreq once. TS jobs do not use this recovery.
-A TS candidate waits for its endpoint jobs and runs direct OptTS followed by
-separate NumFreq, which must give exactly one imaginary frequency. Direct candidates
-use up to `calculation.ts_attempts` OptTS attempts (two by default), stopping on
-convergence. Each repeat uses the last saved geometry, or the previous input if
-no geometry was saved, and calculates a fresh numerical Hessian. If these attempts
-fail, or the subsequent NumFreq fails or does not give exactly one imaginary mode,
-restart from the **original TS guess** and run constrained optimization, fixing the
-Cartesian positions of the donor, transferring hydrogen and acceptor. Repeat that
-optimization once if needed, continuing from its last geometry. Only after it
-converges, run up to two further OptTS attempts, then NumFreq on convergence.
-The retry budgets for all three phases use `calculation.ts_attempts`. Numbered
-OptTS and NumFreq artifacts preserve both the initial and recovery calculations.
-Among successful
+A TS candidate waits for its endpoint jobs and first runs a constrained g-xTB
+optimization (`ts_preopt`) from its original guess. This fixes the Cartesian
+positions of the central metal, hydrogen donor, transferring hydrogen, acceptor,
+and every atom along the shortest mapped acceptor-to-metal path (including
+coordination bonds). For example, an O–C–N–metal path fixes O, C, N and the metal,
+in addition to the donor and transferring hydrogen. Only this preparatory step
+sets `%geom MaxIter 50`; on reaching the cap, its last saved geometry is used.
+A failure before the cap or a missing geometry rejects that candidate.
+
+The constraints are then released for up to `calculation.ts_attempts` OptTS
+attempts (two by default), stopping on convergence. Each repeat uses the last
+saved geometry, or the previous input if no geometry was saved, and calculates
+a fresh numerical Hessian. Converged OptTS is followed by separate NumFreq,
+which must give exactly one imaginary frequency. graphRC then
+analyzes that imaginary mode directly from the NumFreq `.out` file. The atoms in
+its significant bond, angle and dihedral changes must include all three zero-based
+`tsmode` indices: donor, transferring hydrogen and acceptor. Additional atoms are
+allowed. The check uses graphRC's default significance thresholds and writes no
+trajectories. Failed OptTS, failed NumFreq, the wrong imaginary-frequency count,
+or a wrong/unreadable mode all use the same NEB fallback. This sequence replaces
+the former second constrained-TS/OptTS recovery cycle. NEB results must pass the
+same NumFreq and graphRC checks. Among successful
 candidates for each ligand/pair/seating, only the lowest Gibbs-energy TS has
 `retained=1`; all candidate results remain in the database. The fallback waits
 until every candidate finishes. If any succeeds, the fallback is marked `skipped`;
-otherwise it runs NEB-TS followed by NumFreq. Historical single-guess jobs still try direct OptTS,
-then constrained relaxation/OptTS retries, then NEB.
-NEB uses the original coembedded reactant and product geometries with the rxts
-TS guess, preserving their shared atom mapping and alignment.
+otherwise it prepares the endpoints and runs NEB-TS followed by NumFreq.
+Historical single-guess jobs use the same sequence with an inline NEB fallback.
+Before NEB, both original coembedded endpoint geometries are independently
+optimized using the regular endpoint Opt/restart and connectivity checks, with
+`calculation.opt_attempts` attempts (two by default). Their optimized geometries
+are used as NEB endpoints, together with the original rxts TS guess. The original
+coembedded files are preserved, and endpoint-preparation artifacts have distinct
+`neb_reactant_opt` and `neb_product_opt` stage names. Endpoint preparation does
+not add NumFreq calculations or an explicit iteration limit. Every stage uses
+the same configured g-xTB/ALPB solvent setup as the rest of the workflow.
+
+To apply the mode check to existing successful TS candidates, first inspect a
+read-only report, then queue rejected candidates and resume the normal workers:
+
+```sh
+rxflow --config hpc.toml verify-ts --dry-run
+rxflow --config hpc.toml verify-ts
+rxflow --config hpc.toml resume --workers 100 --partition kemi1
+```
+
+Use the corresponding config for each run, or add `--id ID` to verify one TS.
+The audit checks every successful candidate, including those not currently
+retained. It leaves accepted geometries and energies unchanged, and caches passes
+using the output contents, atom mapping and analysis versions. Repeating it does
+not reset pending recoveries or increment their attempts. Rejected candidates
+restart at constrained optimization from their original seeds, followed by OptTS
+and checked NumFreq. A skipped group NEB is reactivated only when no successful
+TS remains, and waits for the recovering direct candidates. Candidates whose
+original seed or indices are unavailable are marked failed for inspection.
+
+Before changing calculation rows, the audit saves a database backup under
+`RESULTS/ts_mode_audits/`; detailed checks and previous rejected energies are
+recorded in `RESULTS/ts_mode_audit.json` and the job's mode metadata. A dry run
+changes no calculation files or database rows. After recovery, run
+`rxflow --config hpc.toml singlepoint submit` to discover replacement TS geometries
+and refresh their DFT corrections.
 
 All ORCA stages use `oet_gxtb_alpb -e XTB_EXE -s h2o`: gas-phase g-xTB plus the
 GFN2(ALPB water) minus GFN2(gas) correction. Gibbs energies come exclusively from
@@ -567,5 +608,5 @@ notebook energy accounting and pathway links have been checked against completed
 cluster results from all four runs.
 
 ```sh
-python -m unittest test_hpc_workflow test_hpc_precursors test_hpc_singlepoint test_reaction_diagrams test_substrate_hydrogens
+python -m unittest test_hpc_workflow test_ts_modes test_hpc_precursors test_hpc_singlepoint test_reaction_diagrams test_substrate_hydrogens
 ```
