@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from contextlib import closing
 import hashlib
+from html import escape
 import json
 from pathlib import Path
 import sqlite3
@@ -17,10 +18,12 @@ class ReactionDiagramTests(unittest.TestCase):
     def setUpClass(cls):
         cls.notebook = json.loads(Path(__file__).with_name('reaction_diagrams.ipynb').read_text())
         cls.keys = ('ligand_id', 'pair_index', 'seating', 'binding_permutation')
-        namespace = dict(Counter=Counter, defaultdict=defaultdict, jobs=[], profiles=[], keys=cls.keys,
+        namespace = dict(Counter=Counter, defaultdict=defaultdict, escape=escape, jobs=[], profiles=[], keys=cls.keys,
                          HARTREE_TO_KCAL=627.509474, BARRIER_LIMIT_KCAL=25.0)
         helper = next(cell for cell in cls.notebook['cells'] if cell.get('id') == 'permutation-coverage')
         exec(compile(''.join(helper['source']), 'notebook helpers', 'exec'), namespace)
+        coverage = next(cell for cell in cls.notebook['cells'] if cell.get('id') == 'reactant-ts-coverage-helpers')
+        exec(compile(''.join(coverage['source']), 'reactant TS coverage helpers', 'exec'), namespace)
         cls.namespace = namespace
 
     def setUp(self):
@@ -154,6 +157,112 @@ class ReactionDiagramTests(unittest.TestCase):
             for key in ('forward_barrier_kcal_mol', 'reverse_barrier_kcal_mol', 'both_barriers_within_limit'):
                 self.assertEqual(before[key], after[key])
         self.assertEqual(len(shifted['routes']), len(self.profiles))
+
+    def coverage_group(self, pair, delta=0., ts_status='failed', ligand='11', **metadata):
+        shared = dict(ligand_id=ligand, pair_index=pair, seating=4, binding_permutation=1,
+                      substrate_site=6, resonance=0, substrate='CC', charge=1, multiplicity=1,
+                      conformer=1, retained=1, updated_at='2026-10-19 12:00:00')
+        shared.update(metadata)
+        reactant = dict(shared, id=pair * 10, endpoint='reactant', status='succeeded', stage='complete',
+                        gibbs_free_energy_eh=-100. + delta / 627.509474)
+        ts = dict(shared, id=pair * 10 + 1, endpoint='TS', status=ts_status, ts_strategy='direct',
+                  stage='complete' if ts_status == 'succeeded' else 'optts',
+                  gibbs_free_energy_eh=-99.9 if ts_status == 'succeeded' else None,
+                  error=None if ts_status == 'succeeded' else 'OptTS attempts did not converge')
+        return [reactant, ts]
+
+    def test_reactant_reference_includes_failed_paths_and_unretained_conformers(self):
+        failed = self.coverage_group(1)
+        failed[0].update(retained=0, conformer=7)
+        higher_conformer = dict(failed[0], id=12, conformer=1, retained=1, gibbs_free_energy_eh=-99.9)
+        failed_energy = dict(failed[0], id=13, status='failed', gibbs_free_energy_eh=-101.)
+        rows = failed + [higher_conformer, failed_energy] + self.coverage_group(2, delta=4., ts_status='succeeded')
+        original = json.dumps(rows, sort_keys=True)
+        report = self.namespace['reactant_ts_coverage'](rows)
+        low, high = report['paths']
+        self.assertEqual(low['reactant_job_id'], failed[0]['id'])
+        self.assertEqual(low['reactant_conformer'], 7)
+        self.assertEqual(low['delta_reactant_kcal_mol'], 0.)
+        self.assertAlmostEqual(high['delta_reactant_kcal_mol'], 4.)
+        self.assertEqual(len(report['low_energy_failed']), 1)
+        self.assertEqual(report['ligands'][0]['minimum_failed'], 1)
+        self.assertEqual(json.dumps(rows, sort_keys=True), original)
+
+    def test_TS_recovery_is_counted_once_and_uses_terminal_NEB_reason(self):
+        rows = self.coverage_group(1)
+        rows.append(dict(rows[-1], id=12, ts_strategy='neb', status='succeeded', error=None))
+        second = self.coverage_group(2, delta=1.)
+        second.append(dict(second[-1], id=22, ts_strategy='neb', stage='freq', error='Wrong final NEB mode'))
+        report = self.namespace['reactant_ts_coverage'](rows + second)
+        self.assertEqual(report['totals']['complete'], 1)
+        self.assertEqual(report['totals']['failed'], 1)
+        self.assertEqual(report['low_energy_failed'][0]['terminal_job_id'], 22)
+        self.assertEqual(report['low_energy_failed'][0]['terminal_reason'], 'Wrong final NEB mode')
+
+    def test_pending_and_running_NEB_recovery_are_not_terminal_failures(self):
+        rows = []
+        for pair, status in [(1, 'pending'), (2, 'running')]:
+            group = self.coverage_group(pair)
+            group.append(dict(group[-1], id=pair * 10 + 2, ts_strategy='neb', status=status))
+            rows.extend(group)
+        report = self.namespace['reactant_ts_coverage'](rows)
+        self.assertEqual(report['totals']['active'], 2)
+        self.assertEqual(report['totals']['failed'], 0)
+        self.assertFalse(report['low_energy_failed'])
+
+    def test_missing_DFT_singlepoint_does_not_turn_a_completed_TS_into_a_failure(self):
+        rows = self.coverage_group(1, ts_status='succeeded')
+        rows[-1].update(gibbs_free_energy_eh=None, gxtb_gibbs_free_energy_eh=-99.9,
+                        singlepoint_selected=True, singlepoint_status='not_queued')
+        second = self.coverage_group(2)
+        second[0].update(gibbs_free_energy_eh=None, gxtb_gibbs_free_energy_eh=-100.)
+        report = self.namespace['reactant_ts_coverage'](rows + second)
+        self.assertEqual(report['totals']['complete'], 1)
+        self.assertEqual(report['totals']['failed'], 1)
+        self.assertFalse(report['low_energy_failed'])
+        self.assertEqual(len(report['unranked']), 1)
+        self.assertIn('DFT single point unavailable', report['unranked'][0]['reactant_energy_reason'])
+        self.assertEqual(report['windows'][-1]['total'], 1)
+
+    def test_resonance_paths_are_preserved_and_sites_share_the_ligand_reference(self):
+        rows = (self.coverage_group(1) + self.coverage_group(2, delta=2., resonance=1)
+                + self.coverage_group(3, delta=5., substrate_site=7, binding_permutation=2))
+        report = self.namespace['reactant_ts_coverage'](rows)
+        self.assertEqual(len(report['paths']), 3)
+        self.assertEqual([row['pair_index'] for row in report['low_energy_failed']], [1, 2])
+        self.assertAlmostEqual(report['paths'][-1]['delta_reactant_kcal_mol'], 5.)
+
+    def test_energy_references_keep_ligands_and_different_compositions_separate(self):
+        rows = (self.coverage_group(1) + self.coverage_group(2, delta=9., ligand='12')
+                + self.coverage_group(3, delta=20., substrate='CCC')
+                + self.coverage_group(4, delta=30., charge=2)
+                + self.coverage_group(5, delta=40., multiplicity=3))
+        report = self.namespace['reactant_ts_coverage'](rows)
+        self.assertTrue(all(row['delta_reactant_kcal_mol'] == 0 for row in report['paths']))
+
+    def test_energy_windows_are_inclusive_and_missing_energies_are_separate(self):
+        rows = self.coverage_group(1) + self.coverage_group(2, delta=3.) + self.coverage_group(3, delta=3.0001)
+        missing = self.coverage_group(4)
+        missing[0].update(status='failed', gibbs_free_energy_eh=-1000.)
+        rows.extend(missing)
+        report = self.namespace['reactant_ts_coverage'](rows, window_kcal=3.)
+        self.assertEqual([row['pair_index'] for row in report['low_energy_failed']], [1, 2])
+        self.assertEqual(report['totals']['failed'], 4)
+        self.assertEqual(len(report['unranked']), 1)
+        self.assertEqual(next(row for row in report['windows'] if row['limit_kcal_mol'] == 0.)['failed'], 1)
+        self.assertEqual(report['windows'][-1]['total'], 3)
+        for invalid in [-1., float('nan'), float('inf')]:
+            with self.assertRaises(ValueError):
+                self.namespace['reactant_ts_coverage'](rows, invalid)
+
+    def test_unprepared_TS_and_nonfinite_reactant_energies_are_reported(self):
+        rows = self.coverage_group(1)[:1]
+        rows[0]['gibbs_free_energy_eh'] = float('nan')
+        rows.append(dict(rows[0], id=12, gibbs_free_energy_eh=float('inf')))
+        report = self.namespace['reactant_ts_coverage'](rows)
+        self.assertEqual(report['totals']['not_prepared'], 1)
+        self.assertEqual(report['totals']['failed'], 0)
+        self.assertEqual(len(report['unranked']), 1)
 
 
 if __name__ == '__main__':

@@ -525,6 +525,19 @@ Permutation coverage continues to count complete reactant–TS–product pathway
 independently of precursor readiness. Pending candidates do not hide successful
 results; rerunning may update the minima while calculations are still active.
 
+The notebook's **TS coverage near the reactant minima** section prioritizes missing
+TS paths by the lowest successful reactant Gibbs energy in each pathway group.
+`TS_FAILURE_WINDOW_KCAL` defaults to 3 kcal/mol above the ligand's lowest available
+reactant, including groups with failed TS searches. Comparisons keep substrate,
+charge and multiplicity the same and use the active plot energy model. Summary
+tables compare the exact minima and 1, 3, 5 and 10 kcal/mol windows, with per-ligand
+counts and failed paths ordered by reactant energy. Higher-energy failures are
+collapsed below the selected window. Counts reflect the final group outcome after
+OptTS/NEB recovery; active recovery, missing DFT single points and unavailable
+reactant energies are kept separate. Pair/resonance identities remain distinct,
+so these pathway counts are not independent conformer populations. Numerical
+results are available as `reactant_ts_report` and `low_energy_failed_paths`.
+
 The single-point workflow evaluates **PBE0/def2-TZVP-D4 with SMD(water)** on the
 currently selected lowest-G(gxTB) geometry for every state. It includes reactants,
 transition states, products, both ligand–metal protonation states, protonated
