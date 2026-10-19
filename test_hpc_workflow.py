@@ -1,18 +1,19 @@
 """TS preoptimization, OptTS retries and preoptimized NEB endpoints."""
 
+import csv
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from hpc_workflow import claim_job, connect_database, run_job
+from hpc_workflow import claim_job, connect_database, regenerate_ts_guess, run_job
 from orca_hpc import orca_input, ts_preoptimization_atoms
 
 
 class TSWorkflowTests(unittest.TestCase):
     def run_candidate(self, results, attempts=2, strategy="direct", mode_checks=None,
-                      recovery=None, neb_fallback=True, changes=None, follow_neb=False):
+                      recovery=None, neb_fallback=True, changes=None, follow_neb=False, refresh_guess=False):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             folder = root / "ligand_01" / "ts_guess"
@@ -28,6 +29,8 @@ class TSWorkflowTests(unittest.TestCase):
                  "opt_attempts": 2, "neb_fallback": neb_fallback}), strategy))
             job = dict(connection.execute("SELECT * FROM jobs").fetchone())
             job["ts_mode_recovery"] = recovery
+            if refresh_guess:
+                job["stage"] = "ts_guess"
             for role in ("reactant", "product"):
                 reactive = root / "ligand_01" / role / "input.xyz_reactive.xyz"
                 reactive.parent.mkdir(parents=True)
@@ -42,10 +45,19 @@ class TSWorkflowTests(unittest.TestCase):
                     VALUES ('1',1,1,'TS',0,?,'unused',1,?,'neb')""",
                     (job["input_xyz"], job["settings_json"]))
             valid_mode = dict(valid=True, fingerprint="mock", reason="All required TS atoms participate")
+
+            def refresh(connection, original_job, results_root, source, sampling):
+                fresh = folder / "fresh_rxts_guess.xyz"
+                fresh.write_text("fresh rxts geometry")
+                return {**original_job, "input_xyz": str(fresh.relative_to(root)),
+                        "ts_guess_json": json.dumps({f"{role}_xyz": f"ligand_01/{role}/input.xyz_reactive.xyz"
+                                                     for role in ("reactant", "product")})}
+
             with patch("hpc_workflow.run_orca", side_effect=results) as calculate, \
                     patch("hpc_workflow.check_ts_mode", side_effect=mode_checks, return_value=valid_mode), \
                     patch("hpc_workflow.molecule_with_xyz"), \
-                    patch("hpc_workflow.connectivity_changes", return_value=changes or {}):
+                    patch("hpc_workflow.connectivity_changes", return_value=changes or {}), \
+                    patch("hpc_workflow.regenerate_ts_guess", side_effect=refresh):
                 run_job(connection, job, root, {})
                 if follow_neb:
                     self.assertEqual(connection.execute("SELECT status FROM jobs WHERE id=?", (job["id"],)).fetchone()[0],
@@ -87,6 +99,21 @@ class TSWorkflowTests(unittest.TestCase):
         self.assertEqual([c.args[4] for c in calls],
                          ["initial geometry", "preoptimized guess", "converged TS"])
         self.assertEqual(optimized, "converged TS")
+
+    def test_reset_candidate_regenerates_guess_before_any_orca_stage(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization("preoptimized guess", converged=True),
+            self.optimization("TS", converged=True), self.frequency()], refresh_guess=True)
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual(calls[0].args[4], 'fresh rxts geometry')
+        self.assertEqual([c.args[3] for c in calls], ['ts_preopt', 'optts', 'freq'])
+
+    def test_reset_neb_uses_matching_pair_from_regenerated_guess(self):
+        row, calls, _ = self.run_candidate(self.neb_results(), strategy='neb', refresh_guess=True)
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual([c.args[3] for c in calls], ['neb_reactant_opt', 'neb_product_opt', 'neb', 'freq'])
+        self.assertEqual(calls[2].args[4], 'fresh rxts geometry')
+        self.assertEqual(calls[2].kwargs['neb_endpoints'], ['optimized reactant', 'optimized product'])
 
     def test_cycle_limited_preoptimization_uses_last_geometry_then_two_optts(self):
         row, calls, _ = self.run_candidate([
@@ -261,6 +288,81 @@ class TSWorkflowTests(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["ts_mode_status"], "failed")
         self.assertEqual(calls[-1].args[3], "freq")
+
+
+class GuessRegenerationTests(unittest.TestCase):
+    SMILES = '[C:1]([H:2])#[N:3]'
+    XYZ = '3\nfixture\nC 0 0 0\nH 1.1 0 0\nN 2.7 0 0\n'
+
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)/'results'
+        self.source = Path(folder.name)/'seeds'
+        (self.root/'ligand_01/ts_guess').mkdir(parents=True)
+        (self.source/'ligand_01').mkdir(parents=True)
+        self.original = self.root/'ligand_01/ts_guess/original_input.xyz'
+        self.original.write_text(self.XYZ)
+        with (self.source/'ligand_01/reaction_pairs.csv').open('w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['reactant_smiles'])
+            writer.writeheader()
+            writer.writerow(dict(reactant_smiles=self.SMILES))
+        self.db = connect_database(':memory:')
+        self.addCleanup(self.db.close)
+        self.db.execute("""INSERT INTO jobs (ligand_id,pair_index,seating,endpoint,conformer,status,stage,
+            attempt,input_xyz,smiles,charge,multiplicity,settings_json,ts_strategy)
+            VALUES ('1',1,1,'TS',1,'running','ts_guess',2,?,?,0,1,'{}','direct')""",
+            (str(self.original.relative_to(self.root)), self.SMILES))
+        self.job = dict(self.db.execute('SELECT * FROM jobs').fetchone())
+
+    def generate(self, left, right, output, **kwargs):
+        for role, name in (('ts_guess', 'reaction.xyz'), ('reactant', 'reaction_reactive.xyz'),
+                           ('product', 'reaction_reactive.xyz')):
+            (output/role).mkdir(parents=True, exist_ok=True)
+            (output/role/name).write_text(self.XYZ)
+        (output/'ts_guess/reaction_selection.json').write_text('{}')
+        return dict(selected_ts_rmsd=.2, seed=kwargs['seed'], ts_mode=dict(donor=0, hydrogen=1, acceptor=2))
+
+    def test_existing_job_regenerates_original_seating_and_keeps_old_input(self):
+        with patch('hpc_workflow.create_endpoint_isomers', return_value=[(0, 'reactant isomer', 'product isomer')]), \
+                patch('hpc_workflow.generate_ts_guess', side_effect=self.generate) as generate:
+            job = regenerate_ts_guess(self.db, self.job, self.root, self.source,
+                                       dict(seed=42, coembed_conformers=10))
+        self.assertEqual(generate.call_args.args[:2], ('reactant isomer', 'product isomer'))
+        self.assertEqual(generate.call_args.kwargs['n'], 10)
+        self.assertNotEqual(generate.call_args.kwargs['seed'], 42)
+        self.assertNotEqual(job['input_xyz'], self.job['input_xyz'])
+        self.assertEqual(job['attempt'], self.job['attempt'])
+        self.assertEqual(self.original.read_text(), self.XYZ)
+        metadata = json.loads(job['ts_guess_json'])
+        self.assertTrue(metadata['valid'])
+        for key in ('reactant_xyz', 'product_xyz', 'selection_file'):
+            self.assertTrue((self.root/metadata[key]).is_file())
+        self.assertEqual(self.db.execute('SELECT input_xyz FROM jobs').fetchone()[0], job['input_xyz'])
+
+    def test_exhausted_guess_generation_fails_before_any_orca_calculation(self):
+        with patch('hpc_workflow.create_endpoint_isomers', return_value=[(0, 'left', 'right')]), \
+                patch('hpc_workflow.generate_ts_guess', side_effect=ValueError('No TS guesses survived after 3 attempts')), \
+                patch('hpc_workflow.run_orca') as orca:
+            run_job(self.db, self.job, self.root, {}, source=self.source)
+        orca.assert_not_called()
+        row = self.db.execute('SELECT * FROM jobs').fetchone()
+        self.assertEqual((row['status'], row['stage']), ('failed', 'ts_guess'))
+        self.assertEqual(row['input_xyz'], self.job['input_xyz'])
+        self.assertIn('3 attempts', row['error'])
+
+    def test_source_resonance_notation_does_not_discard_the_original_binding(self):
+        original = '[O-:1][C:2](=[N+:3]([H:5])[H:6])[C:4]([H:7])([H:8])[H:9]'
+        stored = '[O:1]=[C:2]([N:3]([H:5])[H:6])[C:4]([H:7])([H:8])[H:9]'
+        with (self.source/'ligand_01/reaction_pairs.csv').open('w', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=['reactant_smiles'])
+            writer.writeheader()
+            writer.writerow(dict(reactant_smiles=original))
+        job = {**self.job, 'smiles': stored}
+        with patch('hpc_workflow.create_endpoint_isomers', return_value=[(0, 'left', 'right')]), \
+                patch('hpc_workflow.generate_ts_guess', side_effect=RuntimeError('reached regeneration')):
+            with self.assertRaisesRegex(RuntimeError, 'reached regeneration'):
+                regenerate_ts_guess(self.db, job, self.root, self.source, {})
 
 
 class TSPreoptimizationInputTests(unittest.TestCase):

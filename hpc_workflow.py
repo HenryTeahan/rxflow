@@ -24,7 +24,7 @@ from rdkit import Chem
 
 from orca_hpc import check_ts_mode, molecule_with_xyz, run_orca, ts_mode_fingerprint
 from rxflow import HARTREE_TO_KCAL, SUBSTRATE, ligand_directory, read_ligands
-from rxflow_endpoints import connectivity_changes, mapped_molecule
+from rxflow_endpoints import connectivity_changes, create_endpoint_isomers, generate_ts_guess, mapped_molecule
 
 
 def connect_database(path):
@@ -52,7 +52,7 @@ def connect_database(path):
                        "donor_maps": "TEXT", "substrate_site": "INTEGER", "resonance": "INTEGER",
                        "ts_rmsd": "REAL", "ts_strategy": "TEXT", "ts_mode_status": "TEXT",
                        "ts_mode_fingerprint": "TEXT", "ts_mode_json": "TEXT",
-                       "ts_mode_recovery": "TEXT"}.items():
+                       "ts_mode_recovery": "TEXT", "ts_guess_json": "TEXT"}.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
     return connection
@@ -233,7 +233,48 @@ def select_transition_state(connection, job):
         (*group, *group))
 
 
-def run_job(connection, job, root, executables):
+def regenerate_ts_guess(connection, job, root, source, sampling):
+    """Generate a fresh checked guess for an existing job without replacing its history."""
+    if source is None:
+        raise ValueError("TS guess regeneration requires the configured seed source directory")
+    folder = ligand_directory(Path(source), job["ligand_id"])
+    with (folder / "reaction_pairs.csv").open(newline="") as handle:
+        pairs = list(csv.DictReader(handle))
+    pair = pairs[job["pair_index"] - 1]
+    isomers = next(((left, right) for vacant, left, right in create_endpoint_isomers(pair)
+                    if vacant + 1 == job["seating"]), None)
+    if isomers is None:
+        raise ValueError("The original binding permutation/seating has no coembedding isomers")
+    stored = mapped_molecule(job["smiles"])
+    original = mapped_molecule(pair["reactant_smiles"])
+    edges = lambda mol: {tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))) for bond in mol.GetBonds()}
+    # Native metal preparation can move resonance charges/bond orders. Preserve
+    # atom identities and binding connectivity, rather than rejecting that notation.
+    if ([(a.GetAtomMapNum(), a.GetAtomicNum()) for a in original.GetAtoms()] !=
+            [(a.GetAtomMapNum(), a.GetAtomicNum()) for a in stored.GetAtoms()]
+            or edges(original) != edges(stored) or Chem.GetFormalCharge(original) != job["charge"]):
+        raise ValueError("The stored reaction pair differs from this TS job")
+    output = ligand_directory(root, job["ligand_id"]) / "ts_guess" / f"job_{job['id']}_run_{job['attempt']:02d}_rxts"
+    seed = (int(sampling.get("seed", 12345)) + 1009 * job["id"] + 3 * job["attempt"]) % 2147483647
+    report = generate_ts_guess(*isomers, output, n=sampling.get("coembed_conformers", 10), seed=seed,
+                               multiplicity=job["multiplicity"], keep=1)
+    if all(job.get(name) is not None for name in ("donor", "hydrogen", "acceptor")) and any(
+            report["ts_mode"][name] != job[name] for name in ("donor", "hydrogen", "acceptor")):
+        raise ValueError("The regenerated guess identifies a different mapped H transfer")
+    xyz = output / "ts_guess" / "reaction.xyz"
+    molecule_with_xyz(job["smiles"], xyz.read_text())
+    metadata = dict(valid=True, seed=report.get("seed", seed),
+                    selection_file=str((output / "ts_guess" / "reaction_selection.json").relative_to(root)),
+                    reactant_xyz=str((output / "reactant" / "reaction_reactive.xyz").relative_to(root)),
+                    product_xyz=str((output / "product" / "reaction_reactive.xyz").relative_to(root)))
+    values = dict(input_xyz=str(xyz.relative_to(root)), ts_rmsd=report["selected_ts_rmsd"],
+                  donor=report["ts_mode"]["donor"], hydrogen=report["ts_mode"]["hydrogen"],
+                  acceptor=report["ts_mode"]["acceptor"], ts_guess_json=json.dumps(metadata, sort_keys=True))
+    update_job(connection, job["id"], **values)
+    return {**job, **values}
+
+
+def run_job(connection, job, root, executables, *, source=None, sampling=None):
     """Preoptimize TS guesses, try OptTS, and prepare coembedded endpoints for NEB."""
     settings = {**json.loads(job["settings_json"]), **executables}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
@@ -304,6 +345,8 @@ def run_job(connection, job, root, executables):
             raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
 
     try:
+        if job["endpoint"] == "TS" and job["stage"] == "ts_guess":
+            job = regenerate_ts_guess(connection, job, root, source, sampling or {})
         original = (root / job["input_xyz"]).read_text()
         current = original
         path = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_optimized.xyz"
@@ -339,8 +382,10 @@ def run_job(connection, job, root, executables):
                 endpoints = []
                 ts_folder = Path(job["input_xyz"]).parent
                 prefix = Path(job["input_xyz"]).name.removesuffix("_input.xyz")
+                guess_metadata = json.loads(job.get("ts_guess_json") or "{}")
                 for role in ("reactant", "product"):
-                    reactive_path = root / ts_folder.parent / role / f"{prefix}_reactive.xyz"
+                    reactive_path = (root / guess_metadata[f"{role}_xyz"] if guess_metadata.get(f"{role}_xyz") else
+                                     root / ts_folder.parent / role / f"{prefix}_reactive.xyz")
                     current = reactive_path.read_text()
                     endpoint = connection.execute("""SELECT smiles,charge,multiplicity FROM jobs
                         WHERE ligand_id=? AND pair_index=? AND seating=? AND endpoint=? LIMIT 1""",
@@ -644,14 +689,15 @@ def main(argv=None):
         elif args.command == "worker":
             while (job := claim_job(connection)) is not None:
                 print(f"Job {job['id']}: ligand {job['ligand_id']} {job['endpoint']}", flush=True)
-                run_job(connection, job, root, executables)
+                run_job(connection, job, root, executables,
+                        source=(base / config["paths"]["source"]).resolve(), sampling=config.get("sampling", {}))
         elif args.command == "retry":
             if args.id is None:
                 parser.error("retry requires --id; stop the previous worker before retrying a running row")
             row = connection.execute("SELECT stage FROM jobs WHERE id=?", (args.id,)).fetchone()
             if row and row["stage"] == "sampling":
                 parser.error("Sampling failures need corrected seeds followed by prepare; they cannot be retried as ORCA jobs")
-            connection.execute("UPDATE jobs SET status='pending',stage='opt',error=NULL,retained=NULL,"
+            connection.execute("UPDATE jobs SET status='pending',stage=CASE WHEN stage='ts_guess' THEN 'ts_guess' ELSE 'opt' END,error=NULL,retained=NULL,"
                                "electronic_energy_eh=NULL,gibbs_free_energy_eh=NULL,frequencies_json=NULL,"
                                "imaginary_count=NULL,xyz_file=NULL,out_file=NULL,worker_id=NULL "
                                "WHERE id=? AND status IN ('failed','running')", (args.id,))

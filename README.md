@@ -180,9 +180,38 @@ Sampling coembeds 10 pairs and creates TS guesses from the five lowest TS RMSDs
 gets a separate TS row: `conformer=1..5` is its RMSD rank, `ts_rmsd` records the
 score, and `ts_strategy='direct'` identifies a direct OptTS job. A separate
 `conformer=0`, `ts_strategy='neb'` row is the conditional NEB fallback.
+rxts identifies forming and breaking bonds from the mapped coembedded endpoints;
+the workflow checks `guess.breaking_bonds` and `guess.forming_bonds` before
+accepting each guess. They must
+include the expected C–H bond breaking and a bond forming from that same H to
+the intended acceptor. Additional changes are allowed. The returned lists,
+expected pairs and validation result are saved as `rxts_bond_check` in the
+selection JSON. A failed check records a sampling error and retains the guess
+and energy-profile XYZ files for inspection, without accepting a TS input.
+The native `path.bond_lengths()` data are also checked at the scan frames just
+before and after the selected FF peak: C–H must lengthen while H–acceptor
+shortens. The local measured distances, changing bonds and atom indices are
+saved as `rxts_motion_check`. This uses rxts's existing scan data and adds no
+Hessian or calculation; the later NumFreq/graphRC check still validates the
+optimized TS's imaginary mode.
+If either rxts check fails, the candidate is re-coembedded from its original
+binding isomers using a different seed and the rxts guess is repeated. There
+are at most two such retries after the initial guess (three attempts total).
+Each attempt retains its coembedded endpoints, guess, profile and check results;
+the selection JSON records all seeds and failures. Success stops retries, while
+three failures leave the candidate failed. A later valid candidate can supply
+the group NEB fallback if the first candidate fails all three attempts.
+
+Existing TS jobs reset to `stage='ts_guess'` regenerate their guess on the worker
+from the original reaction pair and seating before any ORCA calculation. They
+use the configured `sampling.coembed_conformers` and distinct seeds for each job
+and workflow attempt. Files go under `ts_guess/job_ID_run_NN_rxts/`; the original
+input and prior calculations are preserved. The accepted guess's matching
+coembedded endpoint paths are recorded in `ts_guess_json` for NEB preparation.
 Existing single-guess seeds retain their previous behavior; retrying old rows
 does not generate additional candidates. Multiple candidates require new sampling.
-Geometry-optimization cycle limits use ORCA's defaults; inputs do not set `MaxIter`.
+Geometry-optimization cycle limits use ORCA's defaults except for the 50-cycle
+constrained TS preoptimization.
 
 The default is 100 independent ORCA workers (`--workers 100`), one CPU and 2 GB
 RAM per worker as configured in `hpc.toml`, with a 24-hour Slurm time limit per
@@ -608,5 +637,5 @@ notebook energy accounting and pathway links have been checked against completed
 cluster results from all four runs.
 
 ```sh
-python -m unittest test_hpc_workflow test_ts_modes test_hpc_precursors test_hpc_singlepoint test_reaction_diagrams test_substrate_hydrogens
+python -m unittest test_hpc_workflow test_ts_modes test_rxts_bonds test_hpc_precursors test_hpc_singlepoint test_reaction_diagrams test_substrate_hydrogens
 ```
