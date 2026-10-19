@@ -221,7 +221,7 @@ def select_endpoints(connection, job):
 
 
 def run_job(connection, job, root, executables):
-    """Optimize endpoints or try direct OptTS before relaxation, then separate NumFreq."""
+    """Optimize endpoints or recover failed direct TS candidates from their original guesses."""
     settings = {**json.loads(job["settings_json"]), **executables}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
 
@@ -233,9 +233,26 @@ def run_job(connection, job, root, executables):
             update_job(connection, job["id"], electronic_energy_eh=result["electronic_energy_eh"])
         return result
 
+    def calculate_frequency(attempt=1):
+        path.write_text(current)
+        update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
+        return calculate("freq", attempt)
+
+    def optimize_with_restarts(stage, first_attempt=1):
+        nonlocal current
+        for attempt in range(first_attempt, first_attempt + settings.get("ts_attempts", 2)):
+            result = calculate(stage, attempt)
+            if result.get("xyz"):
+                current = result["xyz"]
+            if result["converged"] and result.get("xyz"):
+                return True
+        return False
+
     try:
         original = (root / job["input_xyz"]).read_text()
         current = original
+        path = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_optimized.xyz"
+        frequency_result = None
         if job["endpoint"] != "TS":
             result = calculate("opt", 1)
             for attempt in range(2, settings["opt_attempts"] + 1):
@@ -250,10 +267,28 @@ def run_job(connection, job, root, executables):
                                            molecule_with_xyz(job["smiles"], original))
             if any(changes.values()):
                 raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
+        elif job.get("ts_strategy") == "direct":
+            if optimize_with_restarts("optts"):
+                try:
+                    initial_frequency = calculate_frequency()
+                except ValueError:
+                    # Failed/malformed NumFreq output also triggers recovery from the seed.
+                    pass
+                else:
+                    if initial_frequency["imaginary_count"] == 1:
+                        frequency_result = initial_frequency
+            if frequency_result is None:
+                # Preserve the reaction centre of the original guess during pre-relaxation.
+                current = original
+                update_job(connection, job["id"], xyz_file=None, electronic_energy_eh=None,
+                           gibbs_free_energy_eh=None, frequencies_json=None, imaginary_count=None)
+                if not optimize_with_restarts("relax"):
+                    raise RuntimeError("Constrained TS relaxation did not converge")
+                if not optimize_with_restarts("optts", settings.get("ts_attempts", 2) + 1):
+                    raise RuntimeError("OptTS after constrained TS relaxation did not converge")
+                frequency_result = calculate_frequency(2)
         else:
             result = {"converged": False, "xyz": None} if job.get("ts_strategy") == "neb" else calculate("optts", 1)
-            if job.get("ts_strategy") == "direct" and (not result["converged"] or not result["xyz"]):
-                raise RuntimeError("Direct OptTS candidate did not converge")
             if result["converged"] and result["xyz"]:
                 current = result["xyz"]
             elif job.get("ts_strategy") != "neb":
@@ -280,8 +315,8 @@ def run_job(connection, job, root, executables):
                 ts_folder = Path(job["input_xyz"]).parent
                 prefix = Path(job["input_xyz"]).name.removesuffix("_input.xyz")
                 for role in ("reactant", "product"):
-                    path = root / ts_folder.parent / role / f"{prefix}_reactive.xyz"
-                    xyz = path.read_text()
+                    reactive_path = root / ts_folder.parent / role / f"{prefix}_reactive.xyz"
+                    xyz = reactive_path.read_text()
                     endpoint = connection.execute("""SELECT smiles FROM jobs WHERE ligand_id=? AND pair_index=?
                         AND seating=? AND endpoint=? LIMIT 1""",
                         (job["ligand_id"], job["pair_index"], job["seating"], role)).fetchone()
@@ -296,10 +331,7 @@ def run_job(connection, job, root, executables):
                 if not result["converged"] or not result["xyz"]:
                     raise RuntimeError("NEB-TS fallback did not converge")
                 current = result["xyz"]
-        path = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_optimized.xyz"
-        path.write_text(current)
-        update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
-        result = calculate("freq")
+        result = frequency_result if frequency_result is not None else calculate_frequency()
         if job["endpoint"] != "TS" and result["imaginary_count"] > 0:
             tight = calculate("verytightopt")
             if not tight["converged"] or not tight["xyz"]:
@@ -386,13 +418,20 @@ def submit_workflow(config_path, config, *, workers=100, account=None, partition
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("hpc.toml"))
-    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry"))
+    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry", "precursors", "acid-base", "singlepoint"))
+    parser.add_argument("precursor_command", nargs="?", choices=("submit", "prepare", "worker", "status", "retry", "resume", "plan"),
+                        help="Action for the precursors, acid-base or singlepoint workflow")
+    parser.add_argument("--conformers", type=int, default=10, help="Fresh conformers per precursor species (default 10)")
     parser.add_argument("--id", type=int, help="Specific stopped/failed row to retry")
     parser.add_argument("--ligand-index", type=int, help="Zero-based CSV row for a sampling array task")
-    parser.add_argument("--workers", type=int, default=100, help="ORCA workers for submit/resume (default 100)")
+    parser.add_argument("--workers", type=int, help="Workers for submit/resume (default 10 for singlepoint, otherwise 100)")
+    parser.add_argument("--references", action="store_true", help="Retry an ID in the shared single-point reference database")
+    parser.add_argument("--bound", action="store_true", help="Target the per-run protonated bound complexes for acid-base retry")
     parser.add_argument("--account", help="Slurm account for submit/resume")
     parser.add_argument("--partition", help="Slurm partition for submit/resume")
     args = parser.parse_args(argv)
+    if args.workers is None:
+        args.workers = 10 if args.command == "singlepoint" else 100
     config = tomllib.loads(args.config.read_text())
     base = args.config.resolve().parent
     root = (base / config["paths"]["results"]).resolve()
@@ -403,6 +442,16 @@ def main(argv=None):
     for key in ("cpus", "memory_mb", "opt_attempts", "ts_attempts", "timeout_seconds"):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
+    if args.command == "singlepoint":
+        from hpc_singlepoint import handle_singlepoints
+
+        return handle_singlepoints(args, config, base, root, parser)
+    if args.command in ("precursors", "acid-base"):
+        from hpc_precursors import handle_precursors
+
+        return handle_precursors(args, config, base, root, parser)
+    if args.precursor_command is not None:
+        parser.error("The extra action argument is only supported for precursors, acid-base or singlepoint")
     executables = {}
     if args.command in ("submit", "resume", "sample", "worker"):
         keys = ("xtb_exe",) if args.command == "sample" else ("orca_exe", "external_exe", "xtb_exe")

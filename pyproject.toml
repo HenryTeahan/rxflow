@@ -20,7 +20,7 @@ dependencies = [
 rxflow = "hpc_workflow:main"
 
 [tool.setuptools]
-py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "orca_hpc", "run_workflow"]
+py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "hpc_precursors", "hpc_singlepoint", "orca_hpc", "run_workflow"]
 
 [tool.uv]
 # Apply the PR #28 pin to rxts's transitive rxembed requirement too.

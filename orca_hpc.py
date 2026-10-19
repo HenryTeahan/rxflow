@@ -40,6 +40,14 @@ def molecule_with_xyz(smiles, xyz):
 
 def orca_input(xyz, stage, charge, multiplicity, settings, atoms=()):
     """Write ExtOpt inputs; use a separate NumFreq job after optimization."""
+    if stage == "singlepoint":
+        count = int(xyz.splitlines()[0])
+        return ("! PBE0 def2-TZVP D4 SP\n"
+                f"%pal nprocs {settings['cpus']} end\n"
+                f"%maxcore {int(settings['memory_mb'] * 0.75 / settings['cpus'])}\n"
+                '%cpcm\n smd true\n SMDsolvent "water"\nend\n'
+                f"* xyz {charge} {multiplicity}\n"
+                + "\n".join(xyz.splitlines()[2:2 + count]) + "\n*\n")
     parameters = shlex.join(["-e", settings["xtb_exe"], "-s", settings["solvent"]])
     external = settings["external_exe"]
     if any(c in external + parameters for c in ('"', '\n', '\r')):
@@ -92,18 +100,56 @@ def collect_numfreq(text, atom_count):
             "frequencies": frequencies, "imaginary_count": sum(value < 0 for value in frequencies)}
 
 
+def collect_singlepoint(text):
+    """Accept only a normally terminated, converged SCF with a finite final energy."""
+    if "ORCA TERMINATED NORMALLY" not in text:
+        raise ValueError("ORCA single point did not terminate normally")
+    upper = text.upper()
+    if ("SCF CONVERGED AFTER" not in upper or "SCF NOT CONVERGED" in upper
+            or "SCF DID NOT CONVERGE" in upper):
+        raise ValueError("ORCA single-point SCF did not converge")
+    energies = ENERGY.findall(text)
+    if not energies:
+        raise ValueError("ORCA single point has no final electronic energy")
+    energy = float(energies[-1].replace("D", "E").replace("d", "e"))
+    if not math.isfinite(energy):
+        raise ValueError("ORCA single point returned a nonfinite electronic energy")
+    return {"electronic_energy_eh": energy}
+
+
 def run_orca(job, root, settings, stage, xyz, *, attempt=1, neb_endpoints=None):
     """Run one ORCA stage in scratch and retain its flat input/output/geometry artifacts."""
     folder = root / Path(job["input_xyz"]).parent
     stem = f"{Path(job['input_xyz']).stem.removesuffix('_input')}_run_{job['attempt']:02d}_{stage}_{attempt}"
-    atoms = (job["donor"], job["hydrogen"], job["acceptor"]) if job["endpoint"] == "TS" else ()
+    atoms = ((job["donor"], job["hydrogen"], job["acceptor"])
+             if job["endpoint"] == "TS" and stage != "singlepoint" else ())
     inp = orca_input(xyz, stage, job["charge"], job["multiplicity"], settings, atoms)
     (folder / f"{stem}.inp").write_text(inp)
     env = os.environ.copy()
     env.update(OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
-    env["PATH"] = str(Path(settings["orca_exe"]).parent) + os.pathsep + env.get("PATH", "")
+    orca_directory = str(Path(settings["orca_exe"]).parent)
+    env["PATH"] = orca_directory + os.pathsep + env.get("PATH", "")
+    if stage == "singlepoint":
+        env["LD_LIBRARY_PATH"] = orca_directory + (
+            os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    if settings.get("mpirun_exe"):
+        mpi_bin = Path(settings["mpirun_exe"]).parent
+        env["PATH"] = str(mpi_bin) + os.pathsep + env["PATH"]
+        mpi_libraries = [str(mpi_bin.parent / "lib")]
+        if (mpi_bin.parent / "lib64").is_dir():
+            mpi_libraries.append(str(mpi_bin.parent / "lib64"))
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(mpi_libraries +
+            ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     result = {"out_file": str((folder / f"{stem}.out").relative_to(root)), "xyz": None}
-    with tempfile.TemporaryDirectory(prefix="rxflow-orca-", dir=settings.get("scratch") or None) as scratch:
+    scratch_root = settings.get("scratch")
+    if stage == "singlepoint" and not scratch_root:
+        scratch_root = env.get("SCRATCH") or env.get("SLURM_TMPDIR")
+    if scratch_root:
+        Path(scratch_root).mkdir(parents=True, exist_ok=True)
+    command = [settings["orca_exe"], f"{stem}.inp"]
+    if stage == "singlepoint" and settings["cpus"] > 1:
+        command.append("--use-hwthread-cpus")
+    with tempfile.TemporaryDirectory(prefix="rxflow-orca-", dir=scratch_root or None) as scratch:
         work = Path(scratch)
         (work / f"{stem}.inp").write_text(inp)
         if stage == "neb":
@@ -112,7 +158,7 @@ def run_orca(job, root, settings, stage, xyz, *, attempt=1, neb_endpoints=None):
                 (folder / f"{stem}_{name}.xyz").write_text(contents)
         try:
             with (work / f"{stem}.out").open("w") as stdout, (work / f"{stem}.err").open("w") as stderr:
-                process = subprocess.Popen([settings["orca_exe"], f"{stem}.inp"], cwd=work, env=env,
+                process = subprocess.Popen(command, cwd=work, env=env,
                     stdout=stdout, stderr=stderr, start_new_session=True)
                 try:
                     code = process.wait(timeout=settings["timeout_seconds"])
@@ -148,6 +194,10 @@ def run_orca(job, root, settings, stage, xyz, *, attempt=1, neb_endpoints=None):
             result["converged"] = result["converged"] and result["xyz"] is not None
             if stage == "freq":
                 result.update(collect_numfreq(text, int(xyz.splitlines()[0])))
+            if stage == "singlepoint":
+                if not normal:
+                    raise ValueError("ORCA single point failed or timed out")
+                result.update(collect_singlepoint(text))
         finally:
             for path in work.glob(stem + "*"):
                 if path.is_file() and path.suffix in (".inp", ".out", ".err", ".xyz", ".hess", ".trj"):
