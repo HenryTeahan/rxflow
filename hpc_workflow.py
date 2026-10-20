@@ -24,7 +24,9 @@ from rdkit import Chem
 
 from orca_hpc import check_ts_mode, molecule_with_xyz, run_orca, ts_mode_fingerprint
 from rxflow import HARTREE_TO_KCAL, SUBSTRATE, ligand_directory, read_ligands
-from rxflow_endpoints import connectivity_changes, create_endpoint_isomers, generate_ts_guess, mapped_molecule
+from rxflow_endpoints import (CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM, connectivity_changes,
+                             create_endpoint_isomers, generate_ts_guess, mapped_molecule)
+from ts_scan import best_scored_candidate, score_ts_scan
 
 
 def connect_database(path):
@@ -52,7 +54,7 @@ def connect_database(path):
                        "donor_maps": "TEXT", "substrate_site": "INTEGER", "resonance": "INTEGER",
                        "ts_rmsd": "REAL", "ts_strategy": "TEXT", "ts_mode_status": "TEXT",
                        "ts_mode_fingerprint": "TEXT", "ts_mode_json": "TEXT",
-                       "ts_mode_recovery": "TEXT", "ts_guess_json": "TEXT"}.items():
+                       "ts_mode_recovery": "TEXT", "ts_guess_json": "TEXT", "ts_scan_json": "TEXT"}.items():
         if name not in columns:
             connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
     return connection
@@ -224,6 +226,104 @@ def select_endpoints(connection, job):
         (*group, 3.0 / HARTREE_TO_KCAL + 1e-12, *group))
 
 
+def filter_endpoint_conformers(root, *, ligand_id=None, dry_run=False):
+    """Revalidate saved minima, reuse passing conformers, and queue only uncovered states."""
+    root = Path(root).resolve()
+    database = root / "workflow.sqlite"
+    query = "SELECT * FROM jobs WHERE endpoint IN ('reactant','product') AND status='succeeded'"
+    parameters = ()
+    if ligand_id is not None:
+        query += " AND ligand_id=?"
+        parameters = (str(ligand_id),)
+    with closing(sqlite3.connect(f"file:{database}?mode=ro", uri=True)) as source:
+        source.row_factory = sqlite3.Row
+        rows = [dict(row) for row in source.execute(query + " ORDER BY id", parameters)]
+    group_keys = ("ligand_id", "pair_index", "seating", "endpoint")
+    groups, checked, rejected = {}, [], []
+    for job in rows:
+        key = tuple(job[name] for name in group_keys)
+        groups.setdefault(key, []).append(job)
+        try:
+            if not job["xyz_file"]:
+                raise ValueError("No saved optimized geometry")
+            current = molecule_with_xyz(job["smiles"], (root / job["xyz_file"]).read_text())
+            initial = molecule_with_xyz(job["smiles"], (root / job["input_xyz"]).read_text())
+            changes = connectivity_changes(current, initial)
+            reason = f"Connectivity filter rejected: {changes}" if any(changes.values()) else None
+        except (ValueError, OSError, RuntimeError) as exc:
+            changes, reason = None, f"Connectivity filter could not verify geometry: {exc}"
+        record = dict(job_id=job["id"], passed=reason is None, changes=changes, reason=reason)
+        checked.append(record)
+        if reason:
+            rejected.append(record)
+    invalid = {row["job_id"] for row in rejected}
+    selections, reruns = [], []
+    for key, candidates in groups.items():
+        if not any(row["id"] in invalid for row in candidates):
+            continue
+        rank = lambda row: (row["gibbs_free_energy_eh"] is None,
+                            row["gibbs_free_energy_eh"] or 0, row["id"])
+        before = min(candidates, key=rank)
+        good = [row for row in candidates if row["id"] not in invalid]
+        after = min(good, key=rank) if good else None
+        selections.append(dict(zip(group_keys, key), previous_job_id=before["id"],
+                               selected_job_id=after["id"] if after else None,
+                               passing_conformers=len(good)))
+        if not good:
+            # Reuse a verified original embedding only if no optimized conformer passed.
+            for job in sorted(candidates, key=rank):
+                try:
+                    seed = molecule_with_xyz(job["smiles"], (root / job["input_xyz"]).read_text())
+                    if not any(connectivity_changes(seed, seed).values()):
+                        reruns.append(job["id"])
+                        break
+                except (ValueError, OSError, RuntimeError):
+                    continue
+    report = dict(results=str(root), ligand_id=ligand_id, dry_run=dry_run,
+                  distance_change_angstrom=CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM,
+                  examined=len(rows), passed=len(rows) - len(invalid), rejected=len(invalid),
+                  rejected_ids=sorted(invalid), selections=selections, queued_for_rerun=reruns,
+                  jobs=checked, backup_file=None, report_file=None)
+    if dry_run or not invalid:
+        return report
+    with closing(connect_database(database)) as connection:
+        # A preview is safe during a run; applying the filter requires idle target groups.
+        for key in groups:
+            active = connection.execute("""SELECT id FROM jobs WHERE ligand_id=? AND pair_index=?
+                AND seating=? AND status IN ('pending','running') LIMIT 1""", key[:3]).fetchone()
+            if active:
+                raise ValueError(f"Group containing job {active['id']} is still active; filter it after its workers finish")
+        archive = root / "endpoint_filter_audits" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        archive.mkdir(parents=True, exist_ok=False)
+        backup = archive / "workflow.sqlite"
+        with closing(sqlite3.connect(backup)) as saved:
+            connection.backup(saved)
+        report.update(backup_file=str(backup), report_file=str(archive / "filter.json"))
+        report["previous_rows"] = rows
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            for job in rows:
+                current = connection.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone()
+                if dict(current) != job:
+                    raise ValueError(f"Job {job['id']} changed while filtering; no rows were updated")
+            for record in rejected:
+                update_job(connection, record["job_id"], status="failed", stage="connectivity_filter",
+                           retained=0, error=record["reason"])
+            for job_id in reruns:
+                update_job(connection, job_id, status="pending", stage="opt", error=None,
+                           retained=None, worker_id=None, xyz_file=None, out_file=None,
+                           electronic_energy_eh=None, gibbs_free_energy_eh=None,
+                           frequencies_json=None, imaginary_count=None)
+            for selection in selections:
+                select_endpoints(connection, selection)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        Path(report["report_file"]).write_text(json.dumps(report, indent=2) + "\n")
+    return report
+
+
 def select_transition_state(connection, job):
     group = (job["ligand_id"], job["pair_index"], job["seating"])
     connection.execute("""UPDATE jobs SET retained=(id=(SELECT id FROM jobs
@@ -264,6 +364,7 @@ def regenerate_ts_guess(connection, job, root, source, sampling):
     xyz = output / "ts_guess" / "reaction.xyz"
     molecule_with_xyz(job["smiles"], xyz.read_text())
     metadata = dict(valid=True, seed=report.get("seed", seed),
+                    profile_xyz=str((output / "ts_guess" / "reaction_path.xyz").relative_to(root)),
                     selection_file=str((output / "ts_guess" / "reaction_selection.json").relative_to(root)),
                     reactant_xyz=str((output / "reactant" / "reaction_reactive.xyz").relative_to(root)),
                     product_xyz=str((output / "product" / "reaction_reactive.xyz").relative_to(root)))
@@ -278,6 +379,23 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
     """Preoptimize TS guesses, try OptTS, and prepare coembedded endpoints for NEB."""
     settings = {**json.loads(job["settings_json"]), **executables}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
+    scan_recovery = settings.get("ts_scan_recovery", True)
+    scan_report = None
+
+    def score_guess():
+        nonlocal scan_report
+        update_job(connection, job["id"], stage="gxtb_scan")
+        try:
+            scan_report = score_ts_scan(job, root, settings, source)
+        except Exception as exc:
+            report_file = (root / Path(job["input_xyz"]).parent /
+                           f"job_{job['id']}_run_{job['attempt']:02d}_gxtb_scan" / "scoring.json")
+            scan_report = (json.loads(report_file.read_text()) if report_file.is_file()
+                           else dict(valid=False, error=str(exc)))
+            update_job(connection, job["id"], ts_scan_json=json.dumps(scan_report))
+            raise
+        update_job(connection, job["id"], ts_scan_json=json.dumps(scan_report))
+        return (root / scan_report["guess_xyz"]).read_text()
 
     def calculate(stage, attempt=1, endpoints=None, calculation_job=None):
         update_job(connection, job["id"], stage=stage)
@@ -339,21 +457,30 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
         if not result["converged"] or not result["xyz"]:
             raise RuntimeError("ORCA endpoint optimization did not converge")
         current = result["xyz"]
-        changes = connectivity_changes(molecule_with_xyz(endpoint_job["smiles"], current),
-                                       molecule_with_xyz(endpoint_job["smiles"], reference))
+        changes = endpoint_changes(endpoint_job, current, reference)
         if any(changes.values()):
-            raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
+            raise ValueError(f"Graph change or bond-length change exceeding {CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM:g} angstrom: {changes}")
+
+    def endpoint_changes(endpoint_job, current, reference):
+        if endpoint_job["endpoint"] == "encounter":
+            return {}
+        return connectivity_changes(molecule_with_xyz(endpoint_job["smiles"], current),
+                                    molecule_with_xyz(endpoint_job["smiles"], reference))
 
     try:
         if job["endpoint"] == "TS" and job["stage"] == "ts_guess":
             job = regenerate_ts_guess(connection, job, root, source, sampling or {})
         original = (root / job["input_xyz"]).read_text()
         current = original
+        resume_encounter_frequency = job["endpoint"] == "encounter" and job["stage"] == "freq" and job.get("xyz_file")
+        if resume_encounter_frequency:
+            current = (root / job["xyz_file"]).read_text()
+            molecule_with_xyz(job["smiles"], current)
         path = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_optimized.xyz"
         frequency_result = None
-        if job["endpoint"] != "TS":
+        if job["endpoint"] != "TS" and not resume_encounter_frequency:
             optimize_endpoint("opt", job)
-        else:
+        elif job["endpoint"] == "TS":
             strategy = job.get("ts_strategy")
             recovery_only = job.get("ts_mode_recovery") == "relax"
             failure = None
@@ -372,17 +499,43 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
                             frequency_result = calculate_frequency()
                         except ValueError as exc:
                             failure = exc
+                if frequency_result is None and scan_recovery:
+                    # Start from the scored interior peak, not the last failed geometry.
+                    try:
+                        current = score_guess()
+                        update_job(connection, job["id"], xyz_file=None, electronic_energy_eh=None,
+                                   gibbs_free_energy_eh=None, imaginary_count=None, frequencies_json=None,
+                                   ts_mode_status=None, ts_mode_fingerprint=None, ts_mode_json=None)
+                        result = calculate("ts_preopt", 2)
+                        if not result.get("xyz") or not (result["converged"] or result.get("max_cycles_reached")):
+                            raise RuntimeError("Scored-guess preoptimization failed before its 50-cycle limit")
+                        current = result["xyz"]
+                        if not optimize_with_restarts("optts", settings.get("ts_attempts", 2) + 1):
+                            raise RuntimeError("Scored-guess OptTS attempts did not converge")
+                        frequency_result = calculate_frequency(2)
+                    except (ValueError, RuntimeError, OSError) as exc:
+                        failure = exc
             if frequency_result is None:
                 # Modern candidates share one group-level NEB job, claimed only
                 # after every candidate fails. Historical jobs use inline NEB.
                 if strategy == "direct" or not settings["neb_fallback"]:
                     raise failure or RuntimeError("OptTS attempts did not converge")
+                if scan_recovery:
+                    if scan_report is None:
+                        scan_report = best_scored_candidate(connection, job, root)
+                        if scan_report is None:
+                            score_guess()
+                        else:
+                            update_job(connection, job["id"], ts_scan_json=json.dumps(scan_report))
+                    if not scan_report.get("valid"):
+                        raise failure or ValueError(scan_report.get("error", "No usable scored TS guess"))
+                    original = (root / scan_report["guess_xyz"]).read_text()
                 update_job(connection, job["id"], xyz_file=None, electronic_energy_eh=None,
                            gibbs_free_energy_eh=None, frequencies_json=None, imaginary_count=None)
                 endpoints = []
                 ts_folder = Path(job["input_xyz"]).parent
                 prefix = Path(job["input_xyz"]).name.removesuffix("_input.xyz")
-                guess_metadata = json.loads(job.get("ts_guess_json") or "{}")
+                guess_metadata = scan_report or json.loads(job.get("ts_guess_json") or "{}")
                 for role in ("reactant", "product"):
                     reactive_path = (root / guess_metadata[f"{role}_xyz"] if guess_metadata.get(f"{role}_xyz") else
                                      root / ts_folder.parent / role / f"{prefix}_reactive.xyz")
@@ -404,17 +557,16 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
                 if not result["converged"] or not result["xyz"]:
                     raise RuntimeError("NEB-TS fallback did not converge")
                 current = result["xyz"]
-                frequency_result = calculate_frequency(2 if recovery_only or strategy != "neb" else 1)
+                frequency_result = calculate_frequency(3 if scan_recovery else (2 if recovery_only or strategy != "neb" else 1))
         result = frequency_result if frequency_result is not None else calculate_frequency()
         if job["endpoint"] != "TS" and result["imaginary_count"] > 0:
             tight = calculate("verytightopt")
             if not tight["converged"] or not tight["xyz"]:
                 raise RuntimeError("ORCA VeryTightOpt retry did not converge")
             current = tight["xyz"]
-            changes = connectivity_changes(molecule_with_xyz(job["smiles"], current),
-                                           molecule_with_xyz(job["smiles"], original))
+            changes = endpoint_changes(job, current, original)
             if any(changes.values()):
-                raise ValueError(f"Graph change with a distance shift exceeding 2 angstrom: {changes}")
+                raise ValueError(f"Graph change or bond-length change exceeding {CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM:g} angstrom: {changes}")
             path.write_text(current)
             update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
             result = calculate("freq", 2)
@@ -557,11 +709,95 @@ def audit_transition_states(root, *, dry_run=False, job_id=None):
         connection.close()
 
 
-def submit_workflow(config_path, config, *, workers=100, account=None, partition=None, resume=False):
-    """Submit the full workflow, or only ORCA workers for an existing database."""
+def reset_failed_transition_states(root, *, dry_run=False):
+    """Archive prior outcomes and retry failed calculation rows without touching successful/active jobs."""
+    root = Path(root).resolve()
+    database = root / "workflow.sqlite"
+    if not database.is_file():
+        raise ValueError(f"No reaction database: {database}")
+    connection = (sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=60)
+                  if dry_run else connect_database(database))
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE endpoint='TS' ORDER BY id")]
+        eligible = [r for r in rows if r["status"] == "failed" and r["stage"] != "sampling"]
+        report = dict(dry_run=dry_run, results=str(root), reset=len(eligible),
+                      ids=[r["id"] for r in eligible],
+                      sampling_failures=[r["id"] for r in rows if r["status"] == "failed" and r["stage"] == "sampling"],
+                      active_ids=[r["id"] for r in rows if r["status"] in ("pending", "running")],
+                      succeeded=sum(r["status"] == "succeeded" for r in rows),
+                      baseline=[{key: row.get(key) for key in ("id", "ligand_id", "pair_index", "seating",
+                                "binding_permutation", "ts_strategy", "status", "stage", "attempt")} for row in rows])
+        if dry_run or not eligible:
+            return report
+        archive = root / "ts_workflow_resets" / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "_gxtb_scan")
+        archive.mkdir(parents=True, exist_ok=False)
+        with closing(sqlite3.connect(archive / "workflow.sqlite")) as backup:
+            connection.backup(backup)
+        report["backup_file"] = str(archive / "workflow.sqlite")
+        report["report_file"] = str(archive / "reset.json")
+        (archive / "previous_jobs.json").write_text(json.dumps(eligible, indent=2) + "\n")
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            changed = []
+            for row in eligible:
+                current = connection.execute("SELECT status,attempt FROM jobs WHERE id=?", (row["id"],)).fetchone()
+                if tuple(current) != ("failed", row["attempt"]):
+                    continue
+                stage = ("ts_guess" if row["stage"] == "ts_guess" else
+                         "neb" if row["ts_strategy"] == "neb" else "opt")
+                update_job(connection, row["id"], status="pending", stage=stage, error=None,
+                           worker_id=None, retained=None, electronic_energy_eh=None,
+                           gibbs_free_energy_eh=None, frequencies_json=None, imaginary_count=None,
+                           xyz_file=None, out_file=None, ts_mode_recovery=None, ts_mode_status=None,
+                           ts_mode_fingerprint=None, ts_mode_json=None, ts_scan_json=None)
+                changed.append(row["id"])
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        report.update(reset=len(changed), ids=changed)
+        (archive / "reset.json").write_text(json.dumps(report, indent=2) + "\n")
+        return report
+    finally:
+        connection.close()
+
+
+def ts_recovery_status(root):
+    """Compare the latest scan-recovery batch against its archived TS outcomes."""
+    root = Path(root).resolve()
+    archives = sorted((root / "ts_workflow_resets").glob("*_gxtb_scan/reset.json"))
+    if not archives:
+        raise ValueError("No g-xTB scan recovery reset has been recorded")
+    baseline = json.loads(archives[-1].read_text())
+    with closing(sqlite3.connect(f"file:{root / 'workflow.sqlite'}?mode=ro", uri=True)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = [dict(row) for row in connection.execute("SELECT * FROM jobs WHERE endpoint='TS'")]
+    keys = ("ligand_id", "pair_index", "seating", "binding_permutation")
+    covered = lambda data: {tuple(row.get(key) for key in keys) for row in data if row["status"] == "succeeded"}
+    before, after = covered(baseline["baseline"]), covered(rows)
+    reset_ids = set(baseline["ids"])
+    retried = [r for r in rows if r["id"] in reset_ids]
+    states = {state: sum(r["status"] == state for r in retried)
+              for state in ("pending", "running", "succeeded", "failed", "skipped")}
+    scored_successes = [r for r in retried if r["status"] == "succeeded"
+                        and json.loads(r.get("ts_scan_json") or "{}").get("valid")]
+    return dict(results=str(root), baseline_report=str(archives[-1]), reset_jobs=len(retried),
+                **states, scored_guess_successes=len(scored_successes),
+                scored_optts_successes=sum(r["ts_strategy"] != "neb" for r in scored_successes),
+                scored_neb_successes=sum(r["ts_strategy"] == "neb" for r in scored_successes),
+                groups_with_TS_before=len(before), groups_with_TS_now=len(after),
+                newly_covered_groups=[dict(zip(keys, key)) for key in sorted(after - before)],
+                sampling_failures=baseline["sampling_failures"])
+
+
+def submit_workflow(config_path, config, *, workers=100, conformers=10, account=None, partition=None, resume=False):
+    """Schedule reaction workers, precursor discovery/calculations, then DFT submission."""
     base = config_path.resolve().parent
     if workers < 1:
         raise ValueError("At least one worker is required")
+    if conformers < 1:
+        raise ValueError("Precursor conformer count must be positive")
     root = base / config["paths"]["results"]
     if resume:
         if not (root / "workflow.sqlite").is_file():
@@ -590,39 +826,56 @@ def submit_workflow(config_path, config, *, workers=100, account=None, partition
             args.append(f"--array={array}")
         return subprocess.check_output([*args, "--wrap", wrap + " " + stage], text=True).strip().split(";")[0]
 
-    if resume:
-        return dict(orca=submit("orca", "worker", cpus=config["calculation"]["cpus"],
-                                array=f"0-{workers - 1}%{workers}"))
-
-    sampling = submit("sampling", 'sample --ligand-index "$SLURM_ARRAY_TASK_ID"', array=f"0-{len(rows) - 1}")
-    prepared = submit("prepare", "prepare", dependency=sampling, dependency_type="afterany")
+    result = {}
+    prepared = None
+    if not resume:
+        sampling = submit("sampling", 'sample --ligand-index "$SLURM_ARRAY_TASK_ID"', array=f"0-{len(rows) - 1}")
+        prepared = submit("prepare", "prepare", dependency=sampling, dependency_type="afterany")
+        result.update(sampling=sampling, prepare=prepared)
     orca = submit("orca", "worker", cpus=config["calculation"]["cpus"],
                   dependency=prepared, array=f"0-{workers - 1}%{workers}")
-    return dict(sampling=sampling, prepare=prepared, orca=orca)
+    precursor_prepare = submit("precursors-prepare", f"precursors prepare --conformers {conformers}",
+                               dependency=prepared)
+    precursors = submit("precursors", "precursors worker", cpus=config["calculation"]["cpus"],
+                        dependency=precursor_prepare, array=f"0-{workers - 1}%{workers}")
+    # Discover the final minima only after both arrays terminate, including failed
+    # calculations. The regular SP command reuses finished, matching calculations
+    # and submits its own array with the configured DFT resources.
+    singlepoint_command = ["singlepoint", "submit", "--workers", "10"]
+    for flag, value in (("account", account), ("partition", partition)):
+        if value:
+            singlepoint_command.extend((f"--{flag}", value))
+    singlepoint_submit = submit("singlepoint-submit", shlex.join(singlepoint_command),
+                               dependency=f"{orca}:{precursors}", dependency_type="afterany")
+    result.update(orca=orca, precursor_prepare=precursor_prepare, precursors=precursors,
+                  singlepoint_submit=singlepoint_submit)
+    return result
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("hpc.toml"))
-    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry", "precursors", "acid-base", "singlepoint", "verify-ts"))
+    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry", "retry-ts", "ts-recovery-status", "precursors", "acid-base", "singlepoint", "verify-ts", "filter-endpoints"))
     parser.add_argument("precursor_command", nargs="?", choices=("submit", "prepare", "worker", "status", "retry", "resume", "plan"),
                         help="Action for the precursors, acid-base or singlepoint workflow")
     parser.add_argument("--conformers", type=int, default=10, help="Fresh conformers per precursor species (default 10)")
     parser.add_argument("--id", type=int, help="Specific row to retry or verify with verify-ts")
     parser.add_argument("--ligand-index", type=int, help="Zero-based CSV row for a sampling array task")
+    parser.add_argument("--ligand-id", help="Restrict filter-endpoints to one ligand ID")
     parser.add_argument("--workers", type=int, help="Workers for submit/resume (default 10 for singlepoint, otherwise 100)")
     parser.add_argument("--references", action="store_true", help="Retry an ID in the shared single-point reference database")
     parser.add_argument("--bound", action="store_true", help="Target the per-run protonated bound complexes for acid-base retry")
+    parser.add_argument("--encounters", action="store_true", help="Target the encounter queue for precursors retry")
     parser.add_argument("--account", help="Slurm account for submit/resume")
     parser.add_argument("--partition", help="Slurm partition for submit/resume")
-    parser.add_argument("--dry-run", action="store_true", help="For verify-ts, report checks without changing jobs or writing files")
+    parser.add_argument("--dry-run", action="store_true", help="For verify-ts/retry-ts/filter-endpoints, report checks without changing jobs or writing files")
     args = parser.parse_args(argv)
     if args.workers is None:
         args.workers = 10 if args.command == "singlepoint" else 100
     config = tomllib.loads(args.config.read_text())
     base = args.config.resolve().parent
     root = (base / config["paths"]["results"]).resolve()
-    if args.command != "verify-ts":
+    if args.command not in ("verify-ts", "retry-ts", "ts-recovery-status", "filter-endpoints"):
         root.mkdir(parents=True, exist_ok=True)
     settings = config["calculation"]
     settings.pop("max_iterations", None)  # Ignore the removed override in older config files.
@@ -640,12 +893,27 @@ def main(argv=None):
         return handle_precursors(args, config, base, root, parser)
     if args.precursor_command is not None:
         parser.error("The extra action argument is only supported for precursors, acid-base or singlepoint")
+    if args.command == "filter-endpoints":
+        try:
+            result = filter_endpoint_conformers(root, ligand_id=args.ligand_id, dry_run=args.dry_run)
+            print(json.dumps({key: value for key, value in result.items()
+                              if key not in ("jobs", "previous_rows")}, indent=2))
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            parser.error(str(exc))
+        return
     if args.command == "verify-ts":
         try:
             result = audit_transition_states(root, dry_run=args.dry_run, job_id=args.id)
             print(json.dumps({key: value for key, value in result.items() if key != "jobs"}, indent=2))
         except (ValueError, OSError, sqlite3.Error) as exc:
             parser.error(str(exc))
+        return
+    if args.command == "retry-ts":
+        result = reset_failed_transition_states(root, dry_run=args.dry_run)
+        print(json.dumps({key: value for key, value in result.items() if key not in ("baseline", "ids")}, indent=2))
+        return
+    if args.command == "ts-recovery-status":
+        print(json.dumps(ts_recovery_status(root), indent=2))
         return
     executables = {}
     if args.command in ("submit", "resume", "sample", "worker"):
@@ -661,6 +929,7 @@ def main(argv=None):
             parser.error(f"{args.command} requires Slurm's sbatch command")
         try:
             print(submit_workflow(args.config, config, workers=args.workers,
+                                  conformers=args.conformers,
                                   account=args.account, partition=args.partition, resume=args.command == "resume"))
         except (ValueError, subprocess.CalledProcessError) as exc:
             parser.error(str(exc))
@@ -699,7 +968,7 @@ def main(argv=None):
                 parser.error("Sampling failures need corrected seeds followed by prepare; they cannot be retried as ORCA jobs")
             connection.execute("UPDATE jobs SET status='pending',stage=CASE WHEN stage='ts_guess' THEN 'ts_guess' ELSE 'opt' END,error=NULL,retained=NULL,"
                                "electronic_energy_eh=NULL,gibbs_free_energy_eh=NULL,frequencies_json=NULL,"
-                               "imaginary_count=NULL,xyz_file=NULL,out_file=NULL,worker_id=NULL "
+                               "imaginary_count=NULL,xyz_file=NULL,out_file=NULL,worker_id=NULL,ts_scan_json=NULL "
                                "WHERE id=? AND status IN ('failed','running')", (args.id,))
         else:
             for row in connection.execute("SELECT ligand_id,substrate,binding_permutation,substrate_site,endpoint,status,count(*) AS jobs FROM jobs "

@@ -8,11 +8,74 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import numpy as np
+import rxembed
 import rxts
 from rdkit import Chem
 from rxts.structure import Frame, ReactionPath
 
-from rxflow_endpoints import check_rxts_bonds, check_rxts_guess_motion, generate_ts_guess, mapped_molecule
+from rxflow import add_substrate, create_products
+from rxflow_endpoints import (check_rxts_bonds, check_rxts_guess_motion, create_endpoint_isomers,
+                             generate_ts_guess, mapped_molecule)
+
+
+class EndpointStereoTests(unittest.TestCase):
+    # The screened N-bound hydroxylamine arrangement from the failed ligand-3 groups.
+    COORDINATION = ('[O-:1][N@@:2]1([H:19])[C:3](=[O:4])[C:5]([H:20])([H:21])[O:6][c:7]2'
+                    '[n:8]3->[Pd+2:29]<-1<-[n:18]1[c:13](-[c:9]3[c:10]([H:22])[c:11]([H:23])'
+                    '[c:12]2[H:24])[c:14]([H:25])[c:15]([H:26])[c:16]([H:27])[c:17]1[H:28] '
+                    '|atomProp:1.atomNote.s0:10.atomNote.s1:11.atomNote.SPL:12.atomNote.s2|')
+
+    def pair(self, coordination_smiles=None):
+        coordination_smiles = coordination_smiles or self.COORDINATION
+        coordination = mapped_molecule(coordination_smiles)
+        reactant = next(add_substrate(coordination, 'c1ccccc1'))[1]
+        product = next(create_products(reactant, '[Pd+2]'))[2]
+        # Reproduce the saved legacy endpoints, which omitted the donor's point stereo.
+        for mol in (reactant, product):
+            Chem.RemoveStereochemistry(mol)
+        return dict(coordination_smiles=coordination_smiles, metal_geom='SPL',
+                    reactant_smiles=Chem.MolToSmiles(reactant), product_smiles=Chem.MolToSmiles(product))
+
+    def test_saved_endpoints_recover_the_selected_bound_nitrogen_hand(self):
+        pair = self.pair()
+        source = rxembed.metal(mapped_molecule(pair['coordination_smiles']), geometry='SPL')[0]
+        self.assertEqual(source.stereo_label, 'N1:R')
+        isomers = list(create_endpoint_isomers(pair))
+        self.assertTrue(isomers)
+        for _, left, right in isomers:
+            self.assertEqual(left.stereo_label, source.stereo_label)
+            self.assertEqual(right.stereo_label, source.stereo_label)
+            for iso, key in ((left, 'reactant_smiles'), (right, 'product_smiles')):
+                original = mapped_molecule(pair[key])
+                restored = iso.restore(Chem.Mol(iso.mol))
+                self.assertEqual([a.GetAtomMapNum() for a in restored.GetAtoms()],
+                                 [a.GetAtomMapNum() for a in original.GetAtoms()])
+                self.assertEqual(Chem.GetFormalCharge(restored), Chem.GetFormalCharge(original))
+
+    def test_opposite_screened_hand_is_preserved_instead_of_choosing_a_fixed_hand(self):
+        pair = self.pair()
+        pair['coordination_smiles'] = pair['coordination_smiles'].replace('[N@@:2]', '[N@:2]')
+        for _, left, right in create_endpoint_isomers(pair):
+            self.assertEqual(left.stereo_label, 'N1:S')
+            self.assertEqual(right.stereo_label, 'N1:S')
+
+    def test_conflicting_explicit_endpoint_hand_is_rejected(self):
+        pair = self.pair()
+        # Use native SMILES parsing: RDKit's plain writer erases this bound-N tag.
+        pair['reactant_smiles'] = pair['reactant_smiles'].replace('[N:2]', '[N@@:2]')
+        with self.assertRaisesRegex(ValueError, 'conflicts with the screened ligand'):
+            list(create_endpoint_isomers(pair))
+
+    def test_all_unchanged_selected_centres_are_restored_including_carbon(self):
+        coordination = self.COORDINATION.replace('[C:5]([H:20])([H:21])',
+                                                 '[C@:5]([H:20])([F:21])')
+        pair = self.pair(coordination)
+        source = rxembed.metal(mapped_molecule(coordination), geometry='SPL')[0]
+        self.assertIn('C4:', source.stereo_label)
+        self.assertIn('N1:', source.stereo_label)
+        for _, left, right in create_endpoint_isomers(pair):
+            self.assertEqual(left.stereo_label, source.stereo_label)
+            self.assertEqual(right.stereo_label, source.stereo_label)
 
 
 def endpoints():

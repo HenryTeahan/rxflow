@@ -125,6 +125,48 @@ class SinglepointTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'positive integers'):
             calculation_settings(dict(singlepoint=dict(cpus=0)))
 
+    def test_encounter_reuses_identical_electronic_singlepoint_with_its_own_thermal_correction(self):
+        self.prepare()
+        self.finish()
+        source = self.root / 'encounters.sqlite'
+        with closing(connect_precursors(source, encounter=True)):
+            pass
+        self.add(source, 1, 'encounter', -11., -11.3, seating=0)
+        result = self.prepare()
+        self.assertEqual(result['added'], 1)
+        self.assertEqual(result['reused'], 1)
+        row = next(r for r in read_jobs(self.root / 'singlepoints.sqlite') if r['source_kind'] == 'encounter')
+        old = next(r for r in read_jobs(self.root / 'singlepoints.sqlite') if r['id'] == row['reused_from_id'])
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual(row['electronic_energy_eh'], old['electronic_energy_eh'])
+        self.assertAlmostEqual(row['corrected_gibbs_free_energy_eh'], .3 + old['electronic_energy_eh'])
+        data = self.load()
+        self.assertEqual(data['singlepoint_summary']['active_mode'], 'dft')
+        link = data['diagram_references'][0]
+        self.assertEqual(link['encounter_job_id'], 1)
+        self.assertAlmostEqual(link['encounter_gibbs_eh'], row['corrected_gibbs_free_energy_eh'])
+        self.assertAlmostEqual(link['encounter_with_acid_gibbs_eh'],
+                               row['corrected_gibbs_free_energy_eh'] + link['acetic_acid_gibbs_eh'])
+
+    def test_singlepoint_reuse_requires_matching_geometry_charge_and_spin(self):
+        self.prepare()
+        self.finish()
+        source = self.root / 'encounters.sqlite'
+        with closing(connect_precursors(source, encounter=True)):
+            pass
+        self.add(source, 1, 'encounter', -11., -11.3, seating=0, charge=1)
+        self.add(source, 2, 'encounter', -11., -11.3, seating=0, pair=2)
+        self.add(source, 3, 'encounter', -11., -11.3, seating=0, pair=3)
+        with closing(connect_precursors(source, encounter=True)) as db:
+            db.execute('UPDATE jobs SET multiplicity=3 WHERE id=2')
+        geometry = next(r for r in read_jobs(source) if r['id'] == 3)
+        (self.root / geometry['xyz_file']).write_text(XYZ.replace('0.9572', '0.9580'))
+        result = self.prepare()
+        self.assertEqual(result['reused'], 0)
+        rows = [r for r in read_jobs(self.root / 'singlepoints.sqlite') if r['source_kind'] == 'encounter']
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(all(r['status'] == 'pending' and r['reused_from_id'] is None for r in rows))
+
     def test_shared_references_are_not_duplicated_by_another_run(self):
         self.prepare()
         other = self.base / 'other'

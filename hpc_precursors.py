@@ -34,13 +34,13 @@ def acid_base_plan():
                                          ("acetate", "CC(=O)[O-]", -1))]
 
 
-def connect_precursors(path, *, bound=False):
+def connect_precursors(path, *, bound=False, encounter=False):
     """Keep reference calculations separate from the reaction jobs and their role constraint."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=60, isolation_level=None)
     try:
-        roles = "'protonated_bound'" if bound else "'deprotonated','protonated','substrate'"
+        roles = "'encounter'" if encounter else ("'protonated_bound'" if bound else "'deprotonated','protonated','substrate'")
         site_column = "protonation_site INTEGER NOT NULL DEFAULT 0," if bound else ""
         site_key = ",protonation_site" if bound else ""
         connection.execute(f"""CREATE TABLE IF NOT EXISTS jobs (
@@ -290,6 +290,9 @@ def precursor_graph(spec):
         for atom in molecule.GetAtoms():
             atom.SetAtomMapNum(atom.GetIdx() + 1)
         return molecule, molecule
+    if spec["endpoint"] == "encounter":
+        from hpc_encounters import encounter_graph
+        return encounter_graph(spec)
     ligand = Chem.AddHs(Chem.MolFromSmiles(spec["ligand_smiles"]))
     metal = Chem.MolFromSmiles(spec["metal"])
     editable = Chem.RWMol(Chem.CombineMols(ligand, metal))
@@ -325,6 +328,9 @@ def precursor_graph(spec):
 
 def sample_precursor(spec, *, n=10, seed=12345):
     """Freshly embed n total conformers; retain each successful stereo ensemble fairly."""
+    if spec["endpoint"] == "encounter":
+        from hpc_encounters import sample_encounter
+        return sample_encounter(spec, n=n, seed=seed)
     molecule, source = precursor_graph(spec)
     if spec.get("reference_name"):
         # Tiny acid/base molecules otherwise collapse to one seed under RMS pruning.
@@ -351,6 +357,9 @@ def sample_precursor(spec, *, n=10, seed=12345):
 
 
 def precursor_location(spec, conformer):
+    if spec["endpoint"] == "encounter":
+        return ligand_directory(Path(), spec["ligand_id"]) / "complex" / "encounter" / (
+            f"binding_{spec['binding_permutation']:03d}_conformer_{conformer:03d}_input.xyz")
     if spec["endpoint"] == "protonated_bound":
         return ligand_directory(Path(), spec["ligand_id"]) / "complex" / "protonated_bound" / (
             f"pair_{spec['pair_index']:03d}_seating_{spec['seating']:02d}_"
@@ -367,12 +376,17 @@ def precursor_location(spec, conformer):
         f"binding_{spec['binding_permutation']:03d}_{state}_conformer_{conformer:03d}_input.xyz")
 
 
-def prepare_precursors(config, base, root, *, conformers=10, reference=False):
+def prepare_precursors(config, base, root, *, conformers=10, reference=False, ligand_id=None):
     if conformers < 1:
         raise ValueError("Precursor conformer count must be positive")
     plan = acid_base_plan() if reference else precursor_plan(config, base, root)
     links = [] if reference else precursor_links(plan, root / "workflow.sqlite")
-    return prepare_species(config, root, plan, links, conformers=conformers, reference=reference)
+    summary = prepare_species(config, root, plan, links, conformers=conformers, reference=reference)
+    if not reference:
+        from hpc_encounters import prepare_encounters
+        summary["encounters"] = prepare_encounters(config, base, root, conformers=conformers,
+                                                    ligand_id=ligand_id)
+    return summary
 
 
 def prepare_bound_reactants(config, base, root, *, conformers=10):
@@ -388,14 +402,20 @@ def prepare_bound_reactants(config, base, root, *, conformers=10):
                            conformers=conformers, bound=True)
 
 
-def prepare_species(config, root, plan, links, *, conformers=10, reference=False, bound=False):
+def species_protocol(config, plan, links, conformers):
     settings = {key: value for key, value in config["calculation"].items() if key != "max_iterations"}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
     seed = config.get("sampling", {}).get("seed", 12345)
     protocol = json.dumps(dict(version=1, conformers=conformers, seed=seed, settings=settings, plan=plan,
                                links=links), sort_keys=True)
-    database_name = "acid_base.sqlite" if bound else ("references.sqlite" if reference else "precursors.sqlite")
-    connection = connect_precursors(root / database_name, bound=bound)
+    return settings, seed, protocol
+
+
+def prepare_species(config, root, plan, links, *, conformers=10, reference=False, bound=False,
+                    encounter=False, ligand_id=None):
+    settings, seed, protocol = species_protocol(config, plan, links, conformers)
+    database_name = "encounters.sqlite" if encounter else ("acid_base.sqlite" if bound else ("references.sqlite" if reference else "precursors.sqlite"))
+    connection = connect_precursors(root / database_name, bound=bound, encounter=encounter)
     added = repaired = 0
     errors = []
     try:
@@ -407,6 +427,8 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
             table = "bound_reactant_links" if bound else "precursor_links"
             connection.execute(f"INSERT OR IGNORE INTO {table} VALUES (?,?,?,?,?,?,?,?)", tuple(link.values()))
         for spec in plan:
+            if ligand_id is not None and str(spec["ligand_id"]) != str(ligand_id):
+                continue
             identity = (spec["ligand_id"], spec["pair_index"] if bound else spec["binding_permutation"],
                         spec["seating"] if bound else spec["protonation_site"], spec["endpoint"])
             site_filter = " AND protonation_site=?" if bound else ""
@@ -460,7 +482,7 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
                                        state=spec["endpoint"], conformer=conformer, error=detail))
         summary = dict(species=len(plan), conformers_per_species=conformers, added=added, repaired=repaired,
                        errors=errors, plan=plan, links=links)
-        summary_name = "acid_base.json" if bound else ("references.json" if reference else "precursors.json")
+        summary_name = "encounters.json" if encounter else ("acid_base.json" if bound else ("references.json" if reference else "precursors.json"))
         (root / summary_name).write_text(json.dumps(summary, indent=2) + "\n")
         return summary
     finally:
@@ -549,7 +571,10 @@ def balanced_diagram_references(connection, reference_database, reaction_databas
         with closing(sqlite3.connect(f"file:{bound_database}?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
             bound_jobs = [dict(row) for row in db.execute("SELECT * FROM jobs")]
-    return add_bound_reactant_references(result, bound_jobs)
+    from hpc_encounters import add_encounter_references
+    from hpc_singlepoint import read_jobs
+    return add_encounter_references(add_bound_reactant_references(result, bound_jobs),
+                                    read_jobs(reaction_database.with_name("encounters.sqlite")))
 
 
 def load_diagram_inputs(reaction_database, precursor_database=None, reference_database=None, *, energy_mode="auto"):
@@ -573,6 +598,7 @@ def load_diagram_inputs(reaction_database, precursor_database=None, reference_da
     precursor_jobs = read_jobs(precursor_database)
     reference_jobs = read_jobs(reference_database)
     bound_reactant_jobs = read_jobs(reaction_database.with_name("acid_base.sqlite"))
+    encounter_jobs = read_jobs(reaction_database.with_name("encounters.sqlite"))
     links = []
     if precursor_database.is_file():
         with closing(sqlite3.connect(f"file:{precursor_database}?mode=ro", uri=True)) as db:
@@ -585,7 +611,7 @@ def load_diagram_inputs(reaction_database, precursor_database=None, reference_da
             if previous is None or (row["gibbs_free_energy_eh"], row["id"]) < (previous["gibbs_free_energy_eh"], previous["id"]):
                 minima[row["ligand_id"]] = row
     data = dict(jobs=jobs, precursor_jobs=precursor_jobs, reference_jobs=reference_jobs,
-                bound_reactant_jobs=bound_reactant_jobs,
+                bound_reactant_jobs=bound_reactant_jobs, encounter_jobs=encounter_jobs,
                 diagram_references=links, reference_minima=minima)
     from hpc_singlepoint import apply_singlepoint_energies
     return apply_singlepoint_energies(data, reaction_database, precursor_database, reference_database, energy_mode)
@@ -617,6 +643,9 @@ def submit_precursors(config_path, config, *, workers=100, conformers=10, accoun
     plan = acid_base_plan() if reference else precursor_plan(config, base, root)
     if reference:
         plan += bound_reactant_plan(config, base, base / config["paths"]["results"])
+    else:
+        from hpc_encounters import encounter_plan
+        plan += encounter_plan(config, base, root)
     command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve()), workflow])
     wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
     common = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL",
@@ -635,7 +664,7 @@ def submit_precursors(config_path, config, *, workers=100, conformers=10, accoun
         suffix = f" --conformers {conformers}" if stage == "prepare" else ""
         return subprocess.check_output([*args, "--wrap", f"{wrap} {stage}{suffix}"], text=True).strip().split(";")[0]
 
-    prepared = None if resume else submit("prepare")
+    prepared = submit("prepare")
     workers_id = submit("worker", cpus=config["calculation"]["cpus"], dependency=prepared,
                         array=f"0-{workers - 1}%{workers}")
     return dict(prepare=prepared, workers=workers_id, species=len(plan), conformers_per_species=conformers)
@@ -656,7 +685,8 @@ def handle_precursors(args, config, base, root, parser):
         parser.error("plan is supported by singlepoint; use status for this workflow")
     try:
         if action == "prepare":
-            summary = prepare_precursors(config, base, root, conformers=args.conformers, reference=reference)
+            summary = prepare_precursors(config, base, root, conformers=args.conformers, reference=reference,
+                                         ligand_id=getattr(args, "ligand_id", None))
             if reference:
                 bound_summary = prepare_bound_reactants(config, base, run_root, conformers=args.conformers)
                 summary = dict(references=summary, bound_reactants=bound_summary)
@@ -682,9 +712,14 @@ def handle_precursors(args, config, base, root, parser):
         database = root / ("references.sqlite" if reference else "precursors.sqlite")
         if reference and getattr(args, "bound", False):
             database = run_root / "acid_base.sqlite"
+        encounter = getattr(args, "encounters", False)
+        if encounter:
+            if reference or action != "retry":
+                raise ValueError("--encounters is supported only for precursors retry")
+            database = root / "encounters.sqlite"
         if not database.is_file():
             raise ValueError(f"No database exists; use {workflow} submit or prepare first")
-        connection = connect_precursors(database, bound=reference and getattr(args, "bound", False))
+        connection = connect_precursors(database, bound=reference and getattr(args, "bound", False), encounter=encounter)
         try:
             if action == "worker":
                 queues = [(connection, root)]
@@ -692,6 +727,9 @@ def handle_precursors(args, config, base, root, parser):
                 if reference and (run_root / "acid_base.sqlite").is_file():
                     bound_connection = connect_precursors(run_root / "acid_base.sqlite", bound=True)
                     queues.append((bound_connection, run_root))
+                if not reference and (root / "encounters.sqlite").is_file():
+                    bound_connection = connect_precursors(root / "encounters.sqlite", encounter=True)
+                    queues.append((bound_connection, root))
                 try:
                     while True:
                         for queue, queue_root in queues:
@@ -723,7 +761,14 @@ def handle_precursors(args, config, base, root, parser):
                     return
                 paths = {} if reference else dict(reference_database=reference_root(config, base) / "references.sqlite",
                                                   reaction_database=root / "workflow.sqlite")
-                print(json.dumps(precursor_status(connection, **paths), indent=2))
+                summary = precursor_status(connection, **paths)
+                from hpc_singlepoint import read_jobs
+                encounter_rows = read_jobs(root / "encounters.sqlite")
+                from collections import Counter
+                summary["encounters"] = dict(database=str(root / "encounters.sqlite"),
+                    counts=[dict(status=status, jobs=count) for status, count in Counter(
+                        row["status"] for row in encounter_rows).items()])
+                print(json.dumps(summary, indent=2))
         finally:
             connection.close()
     except (ValueError, subprocess.CalledProcessError) as exc:

@@ -98,6 +98,7 @@ def sources(config, base, root):
     return [("reaction", root / "workflow.sqlite", root / "singlepoints.sqlite"),
             ("precursor", root / "precursors.sqlite", root / "singlepoints.sqlite"),
             ("bound_reactant", root / "acid_base.sqlite", root / "singlepoints.sqlite"),
+            ("encounter", root / "encounters.sqlite", root / "singlepoints.sqlite"),
             ("reference", references / "references.sqlite", references / "singlepoints.sqlite")]
 
 
@@ -118,6 +119,12 @@ def connect_singlepoints(path):
         electronic_energy_eh REAL, corrected_gibbs_free_energy_eh REAL,
         out_file TEXT, error TEXT, worker_id TEXT, updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(source_database,source_job_id,source_fingerprint,method))""")
+    if 'reused_from_id' not in {row[1] for row in db.execute('PRAGMA table_info(jobs)')}:
+        try:
+            db.execute('ALTER TABLE jobs ADD COLUMN reused_from_id INTEGER')
+        except sqlite3.OperationalError:
+            if 'reused_from_id' not in {row[1] for row in db.execute('PRAGMA table_info(jobs)')}:
+                raise
     return db
 
 
@@ -156,7 +163,7 @@ def freeze_geometry(target, xyz):
 def prepare_singlepoints(config, base, root):
     plan = plan_singlepoints(config, base, root)
     settings = calculation_settings(config)
-    added = existing = 0
+    added = existing = reused = 0
     errors = []
     for kind, source, destination in sources(config, base, root):
         rows = selected_jobs(read_jobs(source))
@@ -191,7 +198,25 @@ def prepare_singlepoints(config, base, root):
                      str(relative), hashlib.sha256(xyz.encode()).hexdigest(), row["electronic_energy_eh"], row["gibbs_free_energy_eh"]))
                 added += inserted.rowcount
                 existing += int(inserted.rowcount == 0)
-    result = dict(**plan, added=added, existing=existing, errors=errors, settings=settings)
+                if inserted.rowcount:
+                    # A graph/state label does not affect an electronic single point.
+                    # Reuse only the identical frozen XYZ, charge, spin and method.
+                    for previous in db.execute('''SELECT * FROM jobs WHERE status='succeeded'
+                            AND method=? AND geometry_sha256=? AND charge=? AND multiplicity=?
+                            AND electronic_energy_eh IS NOT NULL ORDER BY id''',
+                            (METHOD, hashlib.sha256(xyz.encode()).hexdigest(), row['charge'], row['multiplicity'])):
+                        frozen = destination.parent / previous['input_xyz']
+                        if (not math.isfinite(previous['electronic_energy_eh']) or not frozen.is_file()
+                                or frozen.read_text() != xyz):
+                            continue
+                        energy = previous['electronic_energy_eh']
+                        corrected = row['gibbs_free_energy_eh'] - row['electronic_energy_eh'] + energy
+                        db.execute('''UPDATE jobs SET status='succeeded',electronic_energy_eh=?,
+                            corrected_gibbs_free_energy_eh=?,out_file=?,reused_from_id=? WHERE id=?''',
+                            (energy, corrected, previous['out_file'], previous['id'], inserted.lastrowid))
+                        reused += 1
+                        break
+    result = dict(**plan, added=added, existing=existing, reused=reused, errors=errors, settings=settings)
     root.mkdir(parents=True, exist_ok=True)
     (root / "singlepoints.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -246,10 +271,12 @@ def apply_singlepoint_energies(data, reaction_database, precursor_database, refe
     if mode not in ("auto", "gxtb", "dft"):
         raise ValueError("Energy mode must be auto, gxtb or dft")
     data.setdefault("bound_reactant_jobs", [])
+    data.setdefault("encounter_jobs", [])
     selections = {}
     counts = {}
     for key, source in (("jobs", reaction_database), ("precursor_jobs", precursor_database),
                         ("bound_reactant_jobs", reaction_database.with_name("acid_base.sqlite")),
+                        ("encounter_jobs", reaction_database.with_name("encounters.sqlite")),
                         ("reference_jobs", reference_database)):
         records = read_jobs(source.parent / "singlepoints.sqlite")
         index = {(row["source_database"], row["source_job_id"], row["source_fingerprint"]): row
@@ -332,7 +359,9 @@ def apply_singlepoint_energies(data, reaction_database, precursor_database, refe
             link[f"{role}_with_acid_gibbs_eh"] = total_energy(energy(row), acid)
         links.append(link)
     from hpc_precursors import add_bound_reactant_references
-    data["diagram_references"] = add_bound_reactant_references(links, data["bound_reactant_jobs"])
+    from hpc_encounters import add_encounter_references
+    data["diagram_references"] = add_encounter_references(
+        add_bound_reactant_references(links, data["bound_reactant_jobs"]), data["encounter_jobs"])
     data["reference_minima"] = references
     return data
 

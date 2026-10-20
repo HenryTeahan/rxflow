@@ -21,13 +21,13 @@ dependencies = [
 rxflow = "hpc_workflow:main"
 
 [tool.setuptools]
-py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "hpc_precursors", "hpc_singlepoint", "orca_hpc", "run_workflow"]
+py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "hpc_precursors", "hpc_encounters", "hpc_singlepoint", "orca_hpc", "run_workflow", "ts_scan"]
 
 [tool.uv]
-# Apply the PR #28 pin to rxts's transitive rxembed requirement too.
+# Apply the rxembed pin to rxts's transitive requirement too.
 override-dependencies = ["rxembed"]
 
 [tool.uv.sources]
-rxembed = { git = "https://github.com/aligfellow/rxembed.git", rev = "2c60b21f0eb0aebb5361bae2a968050b616c4dd9" }
+rxembed = { git = "https://github.com/aligfellow/rxembed.git", rev = "730eae5775401d337cfc7b4a770965d0eb88e1bc" }
 rxts = { git = "https://github.com/HenryTeahan/rxts.git", rev = "8eac9f1b2a2d13e52b47a1438961e0fe68a45f47" }
 xyzrender = { git = "https://github.com/HenryTeahan/xyzrender.git", rev = "792799503b31d3a447326bc01444b074286dadb2" }

@@ -22,6 +22,7 @@ from rxflow import HARTREE_TO_KCAL, ligand_directory, run_gxtb
 
 
 LOG = logging.getLogger(__name__)
+CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM = 1.5
 
 
 def mapped_molecule(smiles):
@@ -48,6 +49,34 @@ def create_endpoint_isomers(pair):
         (a.GetAtomMapNum(), a.GetAtomicNum()) for a in product.GetAtoms()
     ]:
         raise ValueError("Endpoint atom inventories differ")
+    # Legacy reaction graphs were made from the unscreened ligand Mol, losing
+    # the bound donor hand selected during coordination screening. Carry the
+    # selected point stereo by atom map only where its local bonds are unchanged.
+    # Native Isomers strip donor-metal bonds; those bonds do not count toward
+    # RDKit's local tetrahedral tag ordering.
+    from rxembed.stereo import defined_stereo_label
+
+    tetrahedral = (Chem.ChiralType.CHI_TETRAHEDRAL_CW, Chem.ChiralType.CHI_TETRAHEDRAL_CCW)
+    carriers = lambda centre: [(bond.GetOtherAtom(centre).GetAtomMapNum(), bond.GetBondType())
+                              for bond in centre.GetBonds() if bond.GetBondType() != Chem.BondType.DATIVE]
+    for endpoint in (reactant, product):
+        by_map = {atom.GetAtomMapNum(): atom for atom in endpoint.GetAtoms()}
+        for original in source.mol.GetAtoms():
+            tag = original.GetChiralTag()
+            if tag not in tetrahedral:
+                continue
+            atom = by_map[original.GetAtomMapNum()]
+            before, after = carriers(original), carriers(atom)
+            if set(before) != set(after):
+                continue  # a reaction changed the centre's constitution
+            order = [after.index(neighbor) for neighbor in before]
+            odd = sum(order[i] > order[j] for i in range(len(order)) for j in range(i + 1, len(order))) % 2
+            if odd:
+                tag = tetrahedral[1] if tag == tetrahedral[0] else tetrahedral[0]
+            if atom.GetChiralTag() not in (Chem.ChiralType.CHI_UNSPECIFIED, tag):
+                raise ValueError(f"Endpoint stereo at atom map {atom.GetAtomMapNum()} conflicts with the screened ligand")
+            atom.SetChiralTag(tag)
+    stereo_labels = [defined_stereo_label(endpoint) for endpoint in (reactant, product)]
     new_donors = [b.GetBeginAtomIdx() for b in reactant.GetBonds()
                   if b.GetBondType() == Chem.BondType.DATIVE and b.GetEndAtomIdx() == source.metal
                   and b.GetBeginAtomIdx() not in source.donors]
@@ -60,16 +89,29 @@ def create_endpoint_isomers(pair):
     for vacant, donor in enumerate(vertices):
         if donor is None:
             seating = {**sites, vacant: new_donors[0]}
-            yield vacant, rxembed.Isomer(reactant, pair["metal_geom"], seating), \
-                rxembed.Isomer(product, pair["metal_geom"], seating)
+            endpoints = [rxembed.Isomer(mol, pair["metal_geom"], seating) for mol in (reactant, product)]
+            # Isomer(mol, geometry, sites) retains metal seating but initializes
+            # its separate ligand-stereo identity empty. Native coembedding and
+            # stereo constraints need the declared identity as well as graph tags.
+            for endpoint, label in zip(endpoints, stereo_labels):
+                endpoint.stereo_label = label
+            yield vacant, *endpoints
 
 
-def connectivity_changes(mol, reference, *, distance_change=2.0):
-    """Report graph changes only when the associated distance moved by more than 2 angstrom."""
+def connectivity_changes(mol, reference, *, distance_change=CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM):
+    """Filter large bond-length changes and loss/change of intended coordination.
+
+    Check every intended bond directly for |final - initial| > distance_change,
+    even if graph perception retains it. Metal coordination has its own native
+    geometry check: a lost donor is rejected even after a smaller movement.
+    An intact metal bond longer than distance_change is not itself a failure.
+    """
     from rxembed.pipeline.metrics import connectivity, coordination_changed
 
     if [a.GetAtomicNum() for a in mol.GetAtoms()] != [a.GetAtomicNum() for a in reference.GetAtoms()]:
         raise ValueError("Connectivity comparison requires the same atoms in the same order")
+    if not math.isfinite(distance_change) or distance_change <= 0:
+        raise ValueError("The bond-length change threshold must be finite and positive")
     start, end = reference.GetConformer(), mol.GetConformer()
 
     def large_distance_change(i, j):
@@ -77,6 +119,16 @@ def connectivity_changes(mol, reference, *, distance_change=2.0):
         after = (end.GetAtomPosition(i) - end.GetAtomPosition(j)).Length()
         return abs(after - before) > distance_change
 
+    distance_changes = []
+    for bond in reference.GetBonds():
+        if bond.GetBondType() == Chem.BondType.ZERO:
+            continue
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        if large_distance_change(i, j):
+            before = (start.GetAtomPosition(i) - start.GetAtomPosition(j)).Length()
+            after = (end.GetAtomPosition(i) - end.GetAtomPosition(j)).Length()
+            distance_changes.append(dict(atoms=[i, j], initial_angstrom=before,
+                                         final_angstrom=after, change_angstrom=after - before))
     formed, broken = connectivity(mol, mol.GetConformer().GetId(), charge=Chem.GetFormalCharge(mol))
     formed = [pair for pair in formed if large_distance_change(*pair)]
     broken = [pair for pair in broken if large_distance_change(*pair)]
@@ -86,15 +138,14 @@ def connectivity_changes(mol, reference, *, distance_change=2.0):
         donors = [b.GetBeginAtomIdx() for b in mol.GetBonds()
                   if b.GetBondType() == Chem.BondType.DATIVE and b.GetEndAtomIdx() == metal]
         left, joined = coordination_changed(mol, mol.GetConformer().GetId(), metal, donors)
-        left = [donor for donor in left if large_distance_change(metal, donor)]
-        joined = [donor for donor in joined if large_distance_change(metal, donor)]
         if left or joined:
             coordination.append({"metal": metal, "left": left, "joined": joined})
-    return {"formed": formed, "broken": broken, "coordination": coordination}
+    return {"formed": formed, "broken": broken, "coordination": coordination,
+            "distance_changes": distance_changes}
 
 
 def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=3, seed=12345):
-    """Optimize conformers, reject graph changes with >2 A distance shifts, retain within 3 kcal/mol."""
+    """Optimize and filter conformers, then retain valid minima within 3 kcal/mol."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     if (output / f"{prefix}_minima.json").exists() or any(output.glob(f"{prefix}_conformer_*")):
@@ -110,7 +161,7 @@ def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=3, seed=
             record = {"conformer": index, "energy_eh": energy, "connectivity": changes,
                       "retained": False}
             if any(changes.values()):
-                record["error"] = "Connectivity changed with an atom-pair distance shift greater than 2 angstrom"
+                record["error"] = "Connectivity filter rejected a bond-length or metal-coordination change"
             else:
                 accepted.append((record, optimized))
             records.append(record)
@@ -126,7 +177,8 @@ def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=3, seed=
                 path.write_text(Chem.MolToXYZBlock(mol))
                 record["xyz"] = str(path.resolve())
     (output / f"{prefix}_minima.json").write_text(json.dumps({"requested": n, "embedded": len(ensemble.ids),
-                                                   "connectivity_distance_change_angstrom": 2.0,
+                                                   "connectivity_distance_change_angstrom": CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM,
+                                                   "coordination_filter": "native donor loss and new coordination, independent of displacement",
                                                    "conformers": records}, indent=2) + "\n")
     return records
 
@@ -277,6 +329,8 @@ def generate_ts_guess(reactant, product, output, *, prefix="reaction", n=10, see
     paired = rxembed.coembed(reactant, product, n=n, seed=seed, threads=1)
     selection = {"requested": n, "coembedded": len(paired), "ts_rmsds": paired.ts_rmsds,
                  "coembed_errors": paired.errors, "seed": seed, "reembed_retries": 2}
+    selection["endpoint_stereo"] = {role: getattr(endpoint, "stereo_label", "")
+                                    for role, endpoint in (("reactant", reactant), ("product", product))}
     selection_path = output / "ts_guess" / f"{prefix}_selection.json"
 
     def save():

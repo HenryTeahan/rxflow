@@ -22,7 +22,7 @@ from hpc_precursors import (acid_base_plan, balanced_diagram_references, connect
                             handle_precursors,
                             precursor_graph, precursor_links, precursor_plan, reference_root,
                             precursor_status, prepare_precursors, sample_precursor, submit_precursors)
-from hpc_workflow import claim_job, main, run_job
+from hpc_workflow import claim_job, connect_database, main, run_job
 from rxflow_endpoints import mapped_molecule
 
 
@@ -132,7 +132,12 @@ class PrecursorTests(unittest.TestCase):
         summary, embed = self.prepare()
         self.assertEqual(summary['species'], 3)
         self.assertEqual(summary['added'], 30)
-        self.assertEqual(embed.call_count, 3)
+        self.assertEqual(embed.call_count, 4)
+        self.assertEqual(summary['encounters']['species'], 1)
+        self.assertEqual(summary['encounters']['added'], 10)
+        with closing(connect_precursors(self.root / 'encounters.sqlite', encounter=True)) as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM jobs').fetchone()[0], 10)
+            self.assertEqual(db.execute('SELECT DISTINCT charge FROM jobs').fetchone()[0], 1)
         self.assertEqual(len(list((self.root / 'ligand_11' / 'complex').glob('*_input.xyz'))), 20)
         self.assertEqual(len(list((self.root / 'substrate').glob('*_input.xyz'))), 10)
         self.assertEqual(hashlib.sha256((self.root / 'workflow.sqlite').read_bytes()).digest(), original)
@@ -206,7 +211,7 @@ class PrecursorTests(unittest.TestCase):
         with patch('hpc_precursors.subprocess.check_output', side_effect=['100\n', '101\n']) as submit:
             result = submit_precursors(config_path, self.config, workers=7)
         self.assertEqual((result['prepare'], result['workers']), ('100', '101'))
-        self.assertEqual(result['species'], 3)
+        self.assertEqual(result['species'], 4)
         first, second = [call.args[0] for call in submit.call_args_list]
         self.assertIn('--cpus-per-task=1', first)
         self.assertIn('--dependency=afterok:100', second)
@@ -214,6 +219,20 @@ class PrecursorTests(unittest.TestCase):
         self.assertIn('precursors prepare --conformers 10', first[-1])
         self.assertIn(str(config_path), second[-1])
         self.assertIn('precursors worker', second[-1])
+
+    def test_resume_discovers_missing_encounters_in_a_compute_job_before_workers(self):
+        self.prepare()
+        with patch('hpc_precursors.subprocess.check_output', side_effect=['100\n', '101\n']) as submit, \
+                patch('hpc_precursors.sample_precursor', side_effect=AssertionError('No foreground sampling')):
+            result = submit_precursors(self.base / 'hpc.toml', self.config,
+                                       resume=True, workers=3, partition='kemi1')
+        self.assertEqual(result['prepare'], '100')
+        self.assertEqual(result['workers'], '101')
+        prepare, workers = [call.args[0] for call in submit.call_args_list]
+        self.assertIn('precursors prepare --conformers 10', prepare[-1])
+        self.assertIn('--dependency=afterok:100', workers)
+        self.assertIn('--partition=kemi1', prepare)
+        self.assertIn('--partition=kemi1', workers)
 
     def test_cli_dispatches_precursors_to_separate_workflow(self):
         config_path = self.base / 'hpc.toml'
@@ -401,6 +420,177 @@ class PrecursorTests(unittest.TestCase):
             handle_precursors(args, self.config, self.base, self.root, argparse.ArgumentParser())
         self.assertEqual(Counter(calls), Counter({('substrate', refs): 20, ('protonated_bound', self.root): 20}))
         self.assertEqual(reference_root(self.config, self.base), (self.base / 'solution_references').resolve())
+
+    def test_encounter_graph_and_native_sampling_have_two_fragments_and_no_substrate_donor(self):
+        from hpc_encounters import encounter_plan, sample_encounter, uncoordinated_substrate
+        from rxembed.stereo import defined_stereo_label
+        plan = encounter_plan(self.config, self.base, self.root)
+        self.assertEqual(len(plan), 1)  # All four A/B/resonance pathways share it.
+        molecule, source = precursor_graph(plan[0])
+        self.assertEqual(len(Chem.GetMolFrags(molecule)), 2)
+        self.assertEqual(Chem.GetFormalCharge(molecule), 1)
+        self.assertEqual(source.stereo_label, defined_stereo_label(molecule))
+        self.assertEqual([b.GetBeginAtomIdx() for b in molecule.GetBonds()
+                          if b.GetBondType() == Chem.BondType.DATIVE], [2, 6, 12])
+        molecule, geometries = sample_encounter(plan[0], n=2)
+        self.assertEqual(len(geometries), 2)
+        geometry = geometries[0]
+        fragments = Chem.GetMolFrags(geometry)
+        metal = next(b.GetEndAtomIdx() for b in geometry.GetBonds() if b.GetBondType() == Chem.BondType.DATIVE)
+        substrate = next(f for f in fragments if metal not in f)
+        moved = Chem.Mol(geometry)
+        conf = moved.GetConformer()
+        displacement = conf.GetAtomPosition(metal) - conf.GetAtomPosition(substrate[0])
+        for i in substrate:
+            conf.SetAtomPosition(i, conf.GetAtomPosition(i) + displacement)
+        self.assertFalse(uncoordinated_substrate(moved))
+        distant = Chem.Mol(geometry)
+        for i in substrate:
+            pos = distant.GetConformer().GetAtomPosition(i)
+            distant.GetConformer().SetAtomPosition(i, (pos.x + 30, pos.y, pos.z))
+        self.assertTrue(uncoordinated_substrate(distant))
+
+    def test_precursor_worker_drains_encounters_with_normal_minimum_protocol(self):
+        self.prepare()
+        calls = []
+        def finish(db, job, root, executables):
+            calls.append(job['endpoint'])
+            db.execute("UPDATE jobs SET status='succeeded',stage='complete' WHERE id=?", (job['id'],))
+        args = SimpleNamespace(command='precursors', precursor_command='worker')
+        with patch('hpc_precursors.shutil.which', return_value='/usr/bin/true'), \
+                patch('hpc_precursors.run_job', side_effect=finish), patch('builtins.print'):
+            handle_precursors(args, self.config, self.base, self.root, argparse.ArgumentParser())
+        self.assertEqual(Counter(calls), Counter(deprotonated=10, protonated=10, substrate=10, encounter=10))
+
+    def test_encounter_job_skips_geometry_filter_and_requires_zero_imaginary_modes(self):
+        self.prepare()
+        with closing(connect_precursors(self.root / 'encounters.sqlite', encounter=True)) as db:
+            job = claim_job(db)
+            xyz = (self.root / job['input_xyz']).read_text()
+            results = [dict(out_file='opt.out', xyz=xyz, converged=True),
+                       dict(out_file='freq.out', electronic_energy_eh=-100., gibbs_free_energy_eh=-99.,
+                            frequencies=[10.], imaginary_count=0)]
+            with patch('hpc_workflow.run_orca', side_effect=results) as orca, \
+                    patch('hpc_workflow.connectivity_changes', side_effect=AssertionError('No encounter filtering')) as check:
+                run_job(db, job, self.root, {})
+            check.assert_not_called()
+            self.assertEqual([c.args[3] for c in orca.call_args_list], ['opt', 'freq'])
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=?', (job['id'],)).fetchone()[0], 'succeeded')
+
+    def test_encounter_links_add_only_acid_and_share_sites_and_resonance(self):
+        from hpc_encounters import add_encounter_references
+        self.prepare()
+        links = [dict(row, acetic_acid_gibbs_eh=-10.) for row in precursor_links(self.plan, self.root / 'workflow.sqlite')]
+        with closing(connect_precursors(self.root / 'encounters.sqlite', encounter=True)) as db:
+            db.execute("UPDATE jobs SET status='succeeded',gibbs_free_energy_eh=-120. WHERE id=1")
+            rows = [dict(r) for r in db.execute('SELECT * FROM jobs')]
+        result = add_encounter_references(links, rows)
+        self.assertEqual(len(result), 4)
+        self.assertEqual({r['encounter_job_id'] for r in result}, {1})
+        self.assertEqual({r['encounter_with_acid_gibbs_eh'] for r in result}, {-130.})
+        self.assertTrue(all(r['encounter_requested'] for r in result))
+
+    def test_one_bad_contact_mode_does_not_discard_good_encounter_seeds(self):
+        from hpc_encounters import encounter_plan, sample_encounter
+        spec, = encounter_plan(self.config, self.base, self.root)
+        molecule, geometries = self.fresh_sample(spec, n=2, seed=12345)
+        ensemble = SimpleNamespace(ids=[0, 1], restored_mol=lambda i: geometries[i])
+        with patch('hpc_encounters.rxembed.nci_modes', return_value={'bad': object(), 'good': object()}), \
+                patch('hpc_encounters.rxembed.embed', side_effect=[ValueError('bad contact'), ensemble]) as embed:
+            result, conformers = sample_encounter(spec, n=2)
+        self.assertEqual(len(conformers), 2)
+        self.assertEqual(embed.call_count, 2)
+        self.assertEqual(result.GetNumAtoms(), molecule.GetNumAtoms())
+
+    def test_prepare_requeues_old_encounter_filter_failures_and_reuses_converged_xyz(self):
+        from hpc_encounters import prepare_encounters
+        self.prepare()
+        database = self.root / 'encounters.sqlite'
+        with closing(connect_precursors(database, encounter=True)) as db:
+            row = dict(db.execute('SELECT * FROM jobs WHERE id=1').fetchone())
+            xyz = (self.root / row['input_xyz']).read_text()
+            (self.root / 'old_opt.xyz').write_text(xyz)
+            (self.root / 'old_opt.out').write_text('THE OPTIMIZATION HAS CONVERGED\nORCA TERMINATED NORMALLY\n')
+            db.execute("UPDATE jobs SET status='failed',stage='opt',error='Graph change or bond-length change: rejected',out_file='old_opt.out' WHERE id=1")
+            db.execute("UPDATE jobs SET status='failed',stage='opt',error='Graph change or bond-length change: rejected' WHERE id=2")
+            db.execute("UPDATE jobs SET status='failed',stage='opt',error='ORCA endpoint optimization did not converge' WHERE id=3")
+        summary = prepare_encounters(self.config, self.base, self.root)
+        self.assertEqual(summary['requeued_geometry_failures'], 2)
+        with closing(connect_precursors(database, encounter=True)) as db:
+            first, second, third = [dict(r) for r in db.execute('SELECT * FROM jobs WHERE id<=3 ORDER BY id')]
+        self.assertEqual((first['status'], first['stage'], first['xyz_file']), ('pending', 'freq', 'old_opt.xyz'))
+        self.assertEqual((second['status'], second['stage']), ('pending', 'opt'))
+        self.assertEqual(third['status'], 'failed')
+        snapshot, = self.root.glob('encounter_filter_resets/*/encounters.sqlite')
+        with closing(sqlite3.connect(snapshot)) as db:
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=1').fetchone()[0], 'failed')
+        self.assertEqual(prepare_encounters(self.config, self.base, self.root)['requeued_geometry_failures'], 0)
+
+    def test_encounter_frequency_restart_and_tightopt_allow_arbitrary_atom_movement(self):
+        self.prepare()
+        with closing(connect_precursors(self.root / 'encounters.sqlite', encounter=True)) as db:
+            row = dict(db.execute('SELECT * FROM jobs WHERE id=1').fetchone())
+            from orca_hpc import molecule_with_xyz
+            geometry = molecule_with_xyz(row['smiles'], (self.root / row['input_xyz']).read_text())
+            # A whole fragment can drift far away, and individual bonds may change.
+            for atom in geometry.GetAtoms():
+                pos = geometry.GetConformer().GetAtomPosition(atom.GetIdx())
+                geometry.GetConformer().SetAtomPosition(atom.GetIdx(), (pos.x * 3, pos.y, pos.z + 30))
+            xyz = Chem.MolToXYZBlock(geometry)
+            (self.root / 'restart.xyz').write_text(xyz)
+            db.execute("UPDATE jobs SET stage='freq',xyz_file='restart.xyz' WHERE id=1")
+            job = claim_job(db)
+            results = [dict(out_file='freq1.out', electronic_energy_eh=-100., gibbs_free_energy_eh=-99.,
+                            frequencies=[-10.], imaginary_count=1),
+                       dict(out_file='tight.out', converged=True, xyz=xyz),
+                       dict(out_file='freq2.out', electronic_energy_eh=-100., gibbs_free_energy_eh=-99.,
+                            frequencies=[10.], imaginary_count=0)]
+            with patch('hpc_workflow.run_orca', side_effect=results) as orca, \
+                    patch('hpc_workflow.connectivity_changes', side_effect=AssertionError('No encounter filter')):
+                run_job(db, job, self.root, {})
+            self.assertEqual([c.args[3] for c in orca.call_args_list], ['freq', 'verytightopt', 'freq'])
+            self.assertEqual(orca.call_args_list[0].args[4], xyz)
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=1').fetchone()[0], 'succeeded')
+
+    def test_detached_minimum_import_preserves_original_results_and_records_provenance(self):
+        from hpc_encounters import encounter_plan, import_encounter_minima, sample_encounter
+        from hpc_precursors import species_protocol
+        spec, = encounter_plan(self.config, self.base, self.root)
+        graph, geometries = sample_encounter(spec, n=1)
+        self.assertTrue(geometries)
+        geometry = geometries[0]
+        metal = next(b.GetEndAtomIdx() for b in graph.GetBonds() if b.GetBondType() == Chem.BondType.DATIVE)
+        substrate = next(f for f in Chem.GetMolFrags(graph) if metal not in f)
+        for i in substrate:
+            pos = geometry.GetConformer().GetAtomPosition(i)
+            geometry.GetConformer().SetAtomPosition(i, (pos.x + 30, pos.y, pos.z))
+        xyz = Chem.MolToXYZBlock(geometry)
+        root = self.base / 'imports'
+        root.mkdir()
+        (root / 'initial.xyz').write_text(xyz)
+        (root / 'optimized.xyz').write_text(xyz)
+        metal = next(b.GetEndAtomIdx() for b in graph.GetBonds() if b.GetBondType() == Chem.BondType.DATIVE)
+        substrate = next(f for f in Chem.GetMolFrags(graph) if metal not in f)
+        reactant = Chem.RWMol(graph)
+        reactant.AddBond(substrate[0], metal, Chem.BondType.DATIVE)
+        settings, _, _ = species_protocol(self.config, [spec], [], 10)
+        with closing(connect_database(root / 'workflow.sqlite')) as db:
+            db.execute('''INSERT INTO jobs (id,ligand_id,pair_index,seating,endpoint,conformer,
+                input_xyz,xyz_file,smiles,charge,multiplicity,settings_json,binding_permutation,
+                status,stage,electronic_energy_eh,gibbs_free_energy_eh,imaginary_count,frequencies_json)
+                VALUES (42,'11',1,4,'reactant',1,'initial.xyz','optimized.xyz',?,1,1,?,1,
+                'failed','connectivity_filter',-100.,-99.,0,'[10.]')''',
+                (Chem.MolToSmiles(reactant), json.dumps(settings)))
+        original = (root / 'workflow.sqlite').read_bytes()
+        count = import_encounter_minima(self.config, root, [spec])
+        self.assertEqual(count, 1)
+        self.assertEqual((root / 'workflow.sqlite').read_bytes(), original)
+        with closing(connect_precursors(root / 'encounters.sqlite', encounter=True)) as db:
+            row = dict(db.execute('SELECT * FROM jobs').fetchone())
+            self.assertEqual((row['status'], row['gibbs_free_energy_eh']), ('succeeded', -99.))
+            self.assertEqual((root / row['xyz_file']).read_text(), xyz)
+            self.assertEqual(db.execute('SELECT source_job_id FROM encounter_imports').fetchone()[0], 42)
+        self.assertEqual(import_encounter_minima(self.config, root, [spec]), 0)
 
 
 if __name__ == '__main__':

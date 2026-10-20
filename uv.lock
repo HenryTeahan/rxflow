@@ -3,7 +3,7 @@ revision = 3
 requires-python = "==3.13.*"
 
 [manifest]
-overrides = [{ name = "rxembed", git = "https://github.com/aligfellow/rxembed.git?rev=2c60b21f0eb0aebb5361bae2a968050b616c4dd9" }]
+overrides = [{ name = "rxembed", git = "https://github.com/aligfellow/rxembed.git?rev=730eae5775401d337cfc7b4a770965d0eb88e1bc" }]
 
 [[package]]
 name = "anyio"
@@ -1390,7 +1390,7 @@ wheels = [
 [[package]]
 name = "rxembed"
 version = "0.1.4"
-source = { git = "https://github.com/aligfellow/rxembed.git?rev=2c60b21f0eb0aebb5361bae2a968050b616c4dd9#2c60b21f0eb0aebb5361bae2a968050b616c4dd9" }
+source = { git = "https://github.com/aligfellow/rxembed.git?rev=730eae5775401d337cfc7b4a770965d0eb88e1bc#730eae5775401d337cfc7b4a770965d0eb88e1bc" }
 dependencies = [
     { name = "networkx" },
     { name = "numpy" },
@@ -1417,7 +1417,7 @@ requires-dist = [
     { name = "ipykernel" },
     { name = "jupyterlab" },
     { name = "nbformat" },
-    { name = "rxembed", extras = ["workflow"], git = "https://github.com/aligfellow/rxembed.git?rev=2c60b21f0eb0aebb5361bae2a968050b616c4dd9" },
+    { name = "rxembed", extras = ["workflow"], git = "https://github.com/aligfellow/rxembed.git?rev=730eae5775401d337cfc7b4a770965d0eb88e1bc" },
     { name = "rxts", extras = ["ff"], git = "https://github.com/HenryTeahan/rxts.git?rev=8eac9f1b2a2d13e52b47a1438961e0fe68a45f47" },
     { name = "xyzrender", git = "https://github.com/HenryTeahan/xyzrender.git?rev=792799503b31d3a447326bc01444b074286dadb2" },
 ]

@@ -13,7 +13,8 @@ from orca_hpc import orca_input, ts_preoptimization_atoms
 
 class TSWorkflowTests(unittest.TestCase):
     def run_candidate(self, results, attempts=2, strategy="direct", mode_checks=None,
-                      recovery=None, neb_fallback=True, changes=None, follow_neb=False, refresh_guess=False):
+                      recovery=None, neb_fallback=True, changes=None, follow_neb=False, refresh_guess=False,
+                      scan_recovery=False, scan_error=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             folder = root / "ligand_01" / "ts_guess"
@@ -26,7 +27,7 @@ class TSWorkflowTests(unittest.TestCase):
                    status,attempt,input_xyz,smiles,charge,settings_json,ts_strategy)
                    VALUES ('1',1,1,'TS',1,'running',1,?, 'unused',1,?,?)""",
                 ("ligand_01/ts_guess/input.xyz", json.dumps({"ts_attempts": attempts,
-                 "opt_attempts": 2, "neb_fallback": neb_fallback}), strategy))
+                 "opt_attempts": 2, "neb_fallback": neb_fallback, "ts_scan_recovery": scan_recovery}), strategy))
             job = dict(connection.execute("SELECT * FROM jobs").fetchone())
             job["ts_mode_recovery"] = recovery
             if refresh_guess:
@@ -46,6 +47,15 @@ class TSWorkflowTests(unittest.TestCase):
                     (job["input_xyz"], job["settings_json"]))
             valid_mode = dict(valid=True, fingerprint="mock", reason="All required TS atoms participate")
 
+            def score(*args):
+                if scan_error:
+                    raise ValueError(scan_error)
+                (folder / 'scored_guess.xyz').write_text('scored interior peak')
+                return dict(valid=True, guess_xyz='ligand_01/ts_guess/scored_guess.xyz',
+                            selected_energy_ev=-10., selected_frame=7,
+                            reactant_xyz='ligand_01/reactant/input.xyz_reactive.xyz',
+                            product_xyz='ligand_01/product/input.xyz_reactive.xyz')
+
             def refresh(connection, original_job, results_root, source, sampling):
                 fresh = folder / "fresh_rxts_guess.xyz"
                 fresh.write_text("fresh rxts geometry")
@@ -57,6 +67,7 @@ class TSWorkflowTests(unittest.TestCase):
                     patch("hpc_workflow.check_ts_mode", side_effect=mode_checks, return_value=valid_mode), \
                     patch("hpc_workflow.molecule_with_xyz"), \
                     patch("hpc_workflow.connectivity_changes", return_value=changes or {}), \
+                    patch("hpc_workflow.score_ts_scan", side_effect=score), \
                     patch("hpc_workflow.regenerate_ts_guess", side_effect=refresh):
                 run_job(connection, job, root, {})
                 if follow_neb:
@@ -288,6 +299,56 @@ class TSWorkflowTests(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["ts_mode_status"], "failed")
         self.assertEqual(calls[-1].args[3], "freq")
+
+    def test_gxtb_recovery_runs_after_two_failures_and_stops_on_valid_ts(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization('preopt', converged=True), self.optimization('failed 1'),
+            self.optimization('failed 2'), self.optimization('scored preopt', converged=True),
+            self.optimization('failed 3'), self.optimization('scored TS', converged=True),
+            self.frequency()], scan_recovery=True)
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual([c.args[3] for c in calls],
+                         ['ts_preopt', 'optts', 'optts', 'ts_preopt', 'optts', 'optts', 'freq'])
+        self.assertEqual([c.kwargs['attempt'] for c in calls], [1, 1, 2, 2, 3, 4, 2])
+        self.assertEqual(calls[3].args[4], 'scored interior peak')
+        self.assertEqual(json.loads(row['ts_scan_json'])['selected_frame'], 7)
+
+    def test_gxtb_is_not_used_when_initial_optts_succeeds(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization('preopt', converged=True), self.optimization('TS', converged=True),
+            self.frequency()], scan_recovery=True, scan_error='must not be called')
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertIsNone(row['ts_scan_json'])
+
+    def test_scoring_failure_does_not_invent_a_guess_or_launch_neb(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization('preopt', converged=True), self.optimization('failed 1'),
+            self.optimization('failed 2')], strategy=None, scan_recovery=True,
+            scan_error='No interior g-xTB local maximum')
+        self.assertEqual(row['status'], 'failed')
+        self.assertIn('No interior', row['error'])
+        self.assertEqual(len(calls), 3)
+        self.assertFalse(json.loads(row['ts_scan_json'])['valid'])
+
+    def test_shared_neb_reuses_failed_candidates_scored_guess_and_pair(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization('preopt', converged=True), self.optimization('failed 1'),
+            self.optimization('failed 2'), self.optimization('scored preopt', converged=True),
+            self.optimization('failed 3'), self.optimization('failed 4'),
+            *self.neb_results()], scan_recovery=True, follow_neb=True)
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual(calls[-2].args[4], 'scored interior peak')
+        self.assertEqual(calls[-2].kwargs['neb_endpoints'], ['optimized reactant', 'optimized product'])
+        self.assertEqual(json.loads(row['ts_scan_json'])['source_job_id'], 1)
+
+    def test_failed_frequency_validation_uses_scored_optts_before_neb(self):
+        row, calls, _ = self.run_candidate([
+            self.optimization('preopt', converged=True), self.optimization('bad TS', converged=True),
+            self.frequency(2), self.optimization('scored preopt', converged=True),
+            self.optimization('good TS', converged=True), self.frequency()], scan_recovery=True)
+        self.assertEqual(row['status'], 'succeeded')
+        self.assertEqual(row['imaginary_count'], 1)
+        self.assertEqual(calls[3].args[4], 'scored interior peak')
 
 
 class GuessRegenerationTests(unittest.TestCase):

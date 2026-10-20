@@ -10,7 +10,11 @@ import sqlite3
 import tempfile
 import unittest
 
+from rdkit import Chem
+from rdkit.Chem import rdDepictor
+
 from hpc_precursors import load_diagram_inputs
+from rxflow import add_substrate
 
 
 class ReactionDiagramTests(unittest.TestCase):
@@ -19,7 +23,10 @@ class ReactionDiagramTests(unittest.TestCase):
         cls.notebook = json.loads(Path(__file__).with_name('reaction_diagrams.ipynb').read_text())
         cls.keys = ('ligand_id', 'pair_index', 'seating', 'binding_permutation')
         namespace = dict(Counter=Counter, defaultdict=defaultdict, escape=escape, jobs=[], profiles=[], keys=cls.keys,
-                         HARTREE_TO_KCAL=627.509474, BARRIER_LIMIT_KCAL=25.0)
+                         HARTREE_TO_KCAL=627.509474, BARRIER_LIMIT_KCAL=25.0,
+                         Chem=Chem, rdDepictor=rdDepictor)
+        site_key = next(cell for cell in cls.notebook['cells'] if cell.get('id') == 'substrate-site-key')
+        exec(compile(''.join(site_key['source']), 'substrate site key', 'exec'), namespace)
         helper = next(cell for cell in cls.notebook['cells'] if cell.get('id') == 'permutation-coverage')
         exec(compile(''.join(helper['source']), 'notebook helpers', 'exec'), namespace)
         coverage = next(cell for cell in cls.notebook['cells'] if cell.get('id') == 'reactant-ts-coverage-helpers')
@@ -36,17 +43,21 @@ class ReactionDiagramTests(unittest.TestCase):
                           protonation_site=1, protonated_start_gibbs_eh=-130.,
                           deprotonated_start_gibbs_eh=-130., protonated_complex_gibbs_eh=-101.,
                           deprotonated_complex_gibbs_eh=-100., substrate_gibbs_eh=-20.,
-                          acetate_gibbs_eh=-9.) for profile in self.profiles]
+                          acetate_gibbs_eh=-9., encounter_gibbs_eh=-100.1,
+                          encounter_with_acid_gibbs_eh=-110.1) for profile in self.profiles]
 
     def diagram(self, profiles=None, links=None, acid=-10.):
         return self.namespace['energy_diagram']('11', self.profiles if profiles is None else profiles,
                                                self.links if links is None else links, acid)
 
-    def test_five_states_balance_spectators_without_counting_substrate_twice(self):
+    def test_encounter_state_balances_spectators_without_counting_substrate_twice(self):
         diagram = self.diagram()
         self.assertEqual(diagram['reference'], -130.)
-        self.assertEqual(diagram['state_keys'], ['protonated_start', 'deprotonated_start', 'reactant', 'TS', 'product'])
+        self.assertEqual(diagram['state_keys'], ['protonated_start', 'deprotonated_start', 'encounter', 'reactant', 'TS', 'product'])
         route = diagram['routes'][0]
+        self.assertEqual(route['energies']['encounter'], -110.1)
+        self.assertIn(('deprotonated_start', 'encounter'), diagram['edges'])
+        self.assertIn(('encounter', 'reactant'), diagram['edges'])
         self.assertEqual(route['energies']['reactant'], -110.)
         self.assertEqual(route['energies']['TS'], -109.98)
         self.assertAlmostEqual(route['relative']['TS'] - route['relative']['reactant'], .02 * 627.509474)
@@ -66,7 +77,9 @@ class ReactionDiagramTests(unittest.TestCase):
         self.assertIn('protonated_bound', diagram['state_keys'])
         self.assertIn(('protonated_start', 'protonated_bound'), diagram['edges'])
         self.assertIn(('protonated_bound', 'reactant'), diagram['edges'])
-        self.assertIn(('deprotonated_start', 'reactant'), diagram['edges'])
+        self.assertIn(('deprotonated_start', 'encounter'), diagram['edges'])
+        self.assertIn(('encounter', 'reactant'), diagram['edges'])
+        self.assertEqual(diagram['state_keys'].index('encounter') + 1, diagram['state_keys'].index('reactant'))
         self.assertNotIn(('deprotonated_start', 'protonated_bound'), diagram['edges'])
         self.assertNotIn(('protonated_bound', 'deprotonated_start'), diagram['edges'])
         self.assertEqual(len(diagram['routes']), 4)
@@ -96,7 +109,8 @@ class ReactionDiagramTests(unittest.TestCase):
     def test_missing_acid_uses_original_diagram_without_mixing_energy_conventions(self):
         diagram = self.diagram(acid=None)
         self.assertFalse(diagram['extended'])
-        self.assertEqual(diagram['state_keys'], ['reactant', 'TS', 'product'])
+        self.assertEqual(diagram['state_keys'], ['encounter', 'reactant', 'TS', 'product'])
+        self.assertEqual(diagram['routes'][0]['energies']['encounter'], -100.1)
         self.assertEqual(diagram['reference'], -100.)
         self.assertEqual(diagram['routes'][0]['energies']['reactant'], -100.)
         self.assertEqual(diagram['routes'][0]['relative']['reactant'], 0.)
@@ -106,7 +120,15 @@ class ReactionDiagramTests(unittest.TestCase):
         self.assertEqual(len(diagram['routes']), 4)
         self.assertIsNone(diagram['routes'][0]['relative']['deprotonated_start'])
         self.assertEqual(diagram['routes'][0]['relative']['reactant'], 0.)
-        self.assertIn('No precursor link', diagram['routes'][0]['missing'][0])
+        self.assertTrue(any('No precursor link' in message for message in diagram['routes'][0]['missing']))
+
+    def test_missing_encounter_stays_blank_and_does_not_change_local_barriers(self):
+        links = [dict(row, encounter_gibbs_eh=None, encounter_with_acid_gibbs_eh=None) for row in self.links]
+        diagram = self.diagram(links=links)
+        for route in diagram['routes']:
+            self.assertIsNone(route['relative']['encounter'])
+            self.assertIn('relaxed encounter complex', route['missing'])
+            self.assertAlmostEqual(route['forward_barrier_kcal_mol'], .02 * 627.509474)
 
     def test_resonance_and_native_protonation_routes_are_not_collapsed(self):
         links = self.links + [dict(self.links[0], protonation_site=3, protonated_start_gibbs_eh=-129.)]
@@ -138,6 +160,37 @@ class ReactionDiagramTests(unittest.TestCase):
             if cell['cell_type'] == 'code':
                 compile(''.join(cell['source']), cell['id'], 'exec')
 
+    def test_substrate_key_matches_sampling_atom_order_and_symmetry_for_all_systems(self):
+        for smiles in ('[H]C1=CC(OC)=C(OC)C(OC)=C1', 'COC(=O)C1=C(F)C=CC=C1F',
+                       'COC(=O)C1=CC=NC=C1'):
+            with self.subTest(substrate=smiles):
+                recorded = {int(site.removeprefix('site_'))
+                            for site, _ in add_substrate(Chem.MolFromSmiles('[Pd+2]'), smiles)}
+                key = self.namespace['substrate_site_key'](smiles, recorded)
+                self.assertEqual({site['substrate_site'] for site in key['sites']}, recorded)
+                self.assertEqual([site['name'] for site in key['sites']], ['A', 'B'])
+                for site in key['sites']:
+                    self.assertIn(site['substrate_site'] - 1, site['atoms'])
+                    for index in site['atoms']:
+                        atom = key['molecule'].GetAtomWithIdx(index)
+                        self.assertFalse(atom.HasProp('atomNote'))
+                        self.assertTrue(atom.GetIsAromatic())
+                        self.assertEqual(atom.GetAtomicNum(), 6)
+                        self.assertGreater(atom.GetTotalNumHs(), 0)
+                # Missing profiles must not rename B to A.
+                partial = self.namespace['substrate_site_key'](smiles, {max(recorded)})
+                self.assertEqual(key['sites'], partial['sites'])
+
+    def test_substrate_key_rejects_wrong_atom_indices(self):
+        with self.assertRaisesRegex(ValueError, 'do not match substrate atom order'):
+            self.namespace['substrate_site_key']('COC(=O)C1=CC=NC=C1', {1})
+
+    def test_site_key_precedes_profiles_and_is_not_repeated_per_ligand(self):
+        cells = self.notebook['cells']
+        indices = {cell['id']: index for index, cell in enumerate(cells)}
+        self.assertLess(indices['substrate-site-key'], indices['560d679e'])
+        self.assertEqual(sum(cell['id'] == 'substrate-site-key' for cell in cells), 1)
+
     def test_both_forward_and_reverse_barriers_must_pass_inclusive_limit(self):
         for forward, reverse, passes in [(24., 24., True), (25., 25., True),
                                          (24., 26., False), (26., 24., False),
@@ -149,7 +202,7 @@ class ReactionDiagramTests(unittest.TestCase):
                 self.assertAlmostEqual(result['reverse_barrier_kcal_mol'], reverse)
                 self.assertEqual(result['both_barriers_within_limit'], passes)
 
-    def test_barriers_use_bound_reaction_step_and_ignore_precursor_energy_zero(self):
+    def test_barriers_include_encounter_and_ignore_acid_and_plot_energy_zero(self):
         original = self.diagram()
         shifted_links = [dict(row, protonated_start_gibbs_eh=-200.) for row in self.links]
         shifted = self.diagram(links=shifted_links, acid=-99.)
@@ -157,6 +210,57 @@ class ReactionDiagramTests(unittest.TestCase):
             for key in ('forward_barrier_kcal_mol', 'reverse_barrier_kcal_mol', 'both_barriers_within_limit'):
                 self.assertEqual(before[key], after[key])
         self.assertEqual(len(shifted['routes']), len(self.profiles))
+
+    def test_forward_reference_is_lower_encounter_or_bound_reactant(self):
+        scale = 627.509474
+        for encounter, expected, reference in [(None, 24., 'reactant'),
+                                                (-20. / scale, 24., 'reactant'),
+                                                (-24. / scale, 24., 'reactant'),
+                                                (-26. / scale, 26., 'encounter')]:
+            with self.subTest(encounter=encounter):
+                profile = dict(TS=0., reactant=-24. / scale, product=-23. / scale, encounter=encounter)
+                result = self.namespace['proton_transfer_barriers'](profile)
+                self.assertAlmostEqual(result['forward_barrier_kcal_mol'], expected)
+                self.assertAlmostEqual(result['bound_forward_barrier_kcal_mol'], 24.)
+                self.assertAlmostEqual(result['reverse_barrier_kcal_mol'], 23.)
+                self.assertEqual(result['forward_reference_state'], reference)
+                self.assertEqual(result['both_barriers_within_limit'], expected <= 25.)
+
+    def test_route_and_grid_caption_use_same_encounter_adjusted_barrier(self):
+        profile = dict(self.profiles[0], encounter=-100.1)
+        expected = self.namespace['proton_transfer_barriers'](profile)
+        route = self.diagram(profiles=[profile])['routes'][0]
+        self.assertEqual(route['forward_reference_state'], 'encounter')
+        self.assertEqual(route['forward_reference_gibbs_eh'], -100.1)
+        self.assertAlmostEqual(route['forward_barrier_kcal_mol'], .12 * 627.509474)
+        self.assertAlmostEqual(route['bound_forward_barrier_kcal_mol'], .02 * 627.509474)
+        self.assertAlmostEqual(route['reverse_barrier_kcal_mol'], .03 * 627.509474)
+        self.assertEqual(route['forward_barrier_kcal_mol'], expected['forward_barrier_kcal_mol'])
+        legend = self.namespace['pathway_grid_legend'](profile, 'N', 17, 0.)
+        self.assertIn(f"Forward {expected['forward_barrier_kcal_mol']:.2f}", legend)
+
+    def test_profile_selection_matches_encounter_to_ligand_and_binding_in_active_model(self):
+        jobs = []
+        for pair, binding in ((1, 1), (2, 2)):
+            group = self.coverage_group(pair, ts_status='succeeded', binding_permutation=binding)
+            group.append(dict(group[0], id=pair * 10 + 2, endpoint='product'))
+            for row in group:
+                row.update(binding_mode=1, coordination_isomer=1)
+            jobs.extend(group)
+        encounters = [dict(id=1, ligand_id='11', binding_permutation=1, status='succeeded', gibbs_free_energy_eh=-100.2),
+                      dict(id=2, ligand_id='11', binding_permutation=2, status='succeeded', gibbs_free_energy_eh=-99.5),
+                      dict(id=3, ligand_id='12', binding_permutation=1, status='succeeded', gibbs_free_energy_eh=-999.),
+                      dict(id=4, ligand_id='11', binding_permutation=1, status='failed', gibbs_free_energy_eh=-999.),
+                      dict(id=5, ligand_id='11', binding_permutation=1, status='succeeded', gibbs_free_energy_eh=None)]
+        namespace = dict(jobs=jobs, encounter_jobs=encounters, defaultdict=defaultdict)
+        cell = next(c for c in self.notebook['cells'] if c.get('id') == '560d679e')
+        exec(compile(''.join(cell['source']), 'profile selection', 'exec'), namespace)
+        first, second = namespace['profiles']
+        self.assertEqual((first['encounter'], first['encounter_job_id']), (-100.2, 1))
+        self.assertEqual((second['encounter'], second['encounter_job_id']), (-99.5, 2))
+        barrier = self.namespace['proton_transfer_barriers']
+        self.assertEqual(barrier(first)['forward_reference_state'], 'encounter')
+        self.assertEqual(barrier(second)['forward_reference_state'], 'reactant')
 
     def coverage_group(self, pair, delta=0., ts_status='failed', ligand='11', **metadata):
         shared = dict(ligand_id=ligand, pair_index=pair, seating=4, binding_permutation=1,
@@ -187,6 +291,20 @@ class ReactionDiagramTests(unittest.TestCase):
         self.assertEqual(len(report['low_energy_failed']), 1)
         self.assertEqual(report['ligands'][0]['minimum_failed'], 1)
         self.assertEqual(json.dumps(rows, sort_keys=True), original)
+
+    def test_grid_caption_uses_failed_group_minimum_and_keeps_both_local_barriers(self):
+        rows = self.coverage_group(1) + self.coverage_group(2, delta=4., ts_status='succeeded')
+        report = self.namespace['reactant_ts_coverage'](rows)
+        relative = {tuple(row[key] for key in self.keys): row['delta_reactant_kcal_mol']
+                    for row in report['paths']}
+        reactant = rows[2]['gibbs_free_energy_eh']
+        profile = dict(ligand_id='11', pair_index=2, seating=4, binding_permutation=1,
+                       substrate_site=6, resonance=0, reactant=reactant,
+                       TS=reactant + 12. / 627.509474, product=reactant - 3. / 627.509474)
+        legend = self.namespace['pathway_grid_legend'](
+            profile, 'N', 17, relative[tuple(profile[key] for key in self.keys)])
+        self.assertIn('Forward 12.00; reverse 15.00 kcal/mol', legend)
+        self.assertIn('Relative reactant G: +4.00 kcal/mol', legend)
 
     def test_TS_recovery_is_counted_once_and_uses_terminal_NEB_reason(self):
         rows = self.coverage_group(1)
