@@ -17,8 +17,11 @@ import tempfile
 
 from hpc_precursors import reference_root
 from orca_hpc import molecule_with_xyz, orca_input, run_orca
+from rxflow import HARTREE_TO_KCAL
 
 METHOD = "PBE0/def2-TZVP-D4/SMD(water)"
+TS_ENERGY_WINDOW_KCAL = 3.0
+TS_WINDOW_SKIP_REASON = "Outside current 3 kcal/mol TS Gibbs-energy window or source changed"
 
 
 def read_jobs(path):
@@ -30,17 +33,42 @@ def read_jobs(path):
         return [dict(row) for row in db.execute("SELECT * FROM jobs")]
 
 
-def selected_jobs(rows):
+def state_key(row):
+    return (*tuple(row[name] for name in ("ligand_id", "pair_index", "seating", "endpoint")),
+            row.get("protonation_site", 0))
+
+
+def lowest_jobs(rows):
     """One lowest-G successful NumFreq result per species/state, ignoring retained."""
     best = {}
     for row in rows:
-        if row.get("status") != "succeeded" or row.get("gibbs_free_energy_eh") is None:
+        if (row.get("status") != "succeeded" or row.get("gibbs_free_energy_eh") is None
+                or not math.isfinite(row["gibbs_free_energy_eh"])):
             continue
-        key = (*tuple(row[name] for name in ("ligand_id", "pair_index", "seating", "endpoint")),
-               row.get("protonation_site", 0))
+        key = state_key(row)
         if key not in best or (row["gibbs_free_energy_eh"], row["id"]) < (best[key]["gibbs_free_energy_eh"], best[key]["id"]):
             best[key] = row
     return list(best.values())
+
+
+def selected_jobs(rows):
+    """Lowest-G minima and every TS within 3 kcal/mol of its group's lowest gxTB G."""
+    rows = list(rows)
+    groups = {}
+    for row in rows:
+        if (row.get("status") == "succeeded" and row.get("gibbs_free_energy_eh") is not None
+                and math.isfinite(row["gibbs_free_energy_eh"])):
+            groups.setdefault(state_key(row), []).append(row)
+    selected = []
+    for group in groups.values():
+        ranked = sorted(group, key=lambda row: (row["gibbs_free_energy_eh"], row["id"]))
+        minimum = ranked[0]
+        if minimum["endpoint"] != "TS":
+            selected.append(minimum)
+            continue
+        cutoff = minimum["gibbs_free_energy_eh"] + TS_ENERGY_WINDOW_KCAL / HARTREE_TO_KCAL
+        selected.extend(row for row in ranked if row["gibbs_free_energy_eh"] <= cutoff + 1e-12)
+    return selected
 
 
 def source_fingerprint(row, xyz):
@@ -138,7 +166,8 @@ def plan_singlepoints(config, base, root):
         summary.append(dict(source_kind=kind, source_database=str(source),
                             singlepoint_database=str(destination), selected_states=len(rows),
                             source_available=source.is_file()))
-    return dict(method=METHOD, sources=summary, selected_states=sum(item["selected_states"] for item in summary))
+    return dict(method=METHOD, ts_energy_window_kcal=TS_ENERGY_WINDOW_KCAL, sources=summary,
+                selected_states=sum(item["selected_states"] for item in summary))
 
 
 def freeze_geometry(target, xyz):
@@ -163,13 +192,14 @@ def freeze_geometry(target, xyz):
 def prepare_singlepoints(config, base, root):
     plan = plan_singlepoints(config, base, root)
     settings = calculation_settings(config)
-    added = existing = reused = 0
+    added = existing = reused = skipped = reactivated = 0
     errors = []
     for kind, source, destination in sources(config, base, root):
         rows = selected_jobs(read_jobs(source))
-        if not rows:
+        if not rows and not destination.is_file():
             continue
         with closing(connect_singlepoints(destination)) as db:
+            selected_ts = set()
             for row in rows:
                 try:
                     xyz = source_geometry(row, source)
@@ -178,6 +208,8 @@ def prepare_singlepoints(config, base, root):
                     errors.append(dict(source_kind=kind, source_job_id=row["id"], error=str(exc)))
                     continue
                 identity = (str(source.resolve()), row["id"], fingerprint, METHOD)
+                if row["endpoint"] == "TS":
+                    selected_ts.add((row["id"], fingerprint))
                 if db.execute("SELECT id FROM jobs WHERE source_database=? AND source_job_id=? AND source_fingerprint=? AND method=?", identity).fetchone():
                     existing += 1
                     continue
@@ -216,7 +248,23 @@ def prepare_singlepoints(config, base, root):
                             (energy, corrected, previous['out_file'], previous['id'], inserted.lastrowid))
                         reused += 1
                         break
-    result = dict(**plan, added=added, existing=existing, reused=reused, errors=errors, settings=settings)
+            # A newly found lower TS can move an old pending correction outside
+            # the window. Preserve completed work, but do not calculate stale seeds.
+            previous = db.execute("""SELECT id,source_job_id,source_fingerprint,status,error FROM jobs
+                WHERE source_database=? AND endpoint='TS' AND method=?
+                AND status IN ('pending','skipped')""", (str(source.resolve()), METHOD)).fetchall()
+            for queued in previous:
+                selected = (queued["source_job_id"], queued["source_fingerprint"]) in selected_ts
+                if queued["status"] == "pending" and not selected:
+                    db.execute("UPDATE jobs SET status='skipped',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
+                               (TS_WINDOW_SKIP_REASON, queued["id"]))
+                    skipped += 1
+                elif queued["status"] == "skipped" and selected and queued["error"] == TS_WINDOW_SKIP_REASON:
+                    db.execute("UPDATE jobs SET status='pending',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='skipped'",
+                               (queued["id"],))
+                    reactivated += 1
+    result = dict(**plan, added=added, existing=existing, reused=reused, skipped=skipped,
+                  reactivated=reactivated, errors=errors, settings=settings)
     root.mkdir(parents=True, exist_ok=True)
     (root / "singlepoints.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -328,10 +376,10 @@ def apply_singlepoint_energies(data, reaction_database, precursor_database, refe
             updated.append(row)
         data[key] = updated
     precursors = {tuple(row[name] for name in ("ligand_id", "pair_index", "seating", "endpoint")): row
-                  for row in selected_jobs(data["precursor_jobs"])}
-    references = {row["ligand_id"]: row for row in selected_jobs(data["reference_jobs"])}
+                  for row in lowest_jobs(data["precursor_jobs"])}
+    references = {row["ligand_id"]: row for row in lowest_jobs(data["reference_jobs"])}
     bound = {tuple(row[name] for name in ("ligand_id", "pair_index", "seating", "endpoint")): row
-             for row in selected_jobs(data["jobs"])}
+             for row in lowest_jobs(data["jobs"])}
 
     def energy(row):
         return row["gibbs_free_energy_eh"] if row else None
@@ -406,11 +454,14 @@ def submit_singlepoints(config_path, config, *, workers=10, account=None, partit
             raise ValueError("Pending single points require larger resources than the configured singlepoint allocation")
     workers = min(workers, len(pending))
     command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve()), "singlepoint", "worker"])
+    logs = base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
     args = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL", "--job-name=rxflow-singlepoint",
             f"--array=0-{workers - 1}%{workers}", "--nodes=1",
             f"--ntasks={settings['cpus']}", "--cpus-per-task=1", "--no-requeue",
             f"--mem={settings['memory_mb']}", f"--time={math.ceil(settings['timeout_seconds'] / 60)}",
-            f"--output={base / 'singlepoint-%A_%a.out'}"]
+            f"--output={logs / 'singlepoint-%A_%a.out'}",
+            f"--error={logs / 'singlepoint-%A_%a.err'}"]
     for flag, value in (("account", account), ("partition", partition)):
         if value:
             args.append(f"--{flag}={value}")

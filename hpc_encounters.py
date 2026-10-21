@@ -7,6 +7,7 @@ import sqlite3
 
 from rdkit import Chem
 import rxembed
+from conformer_sampling import embedded_conformers, prune_conformers
 
 from orca_hpc import molecule_with_xyz
 from rxflow import read_ligands
@@ -38,7 +39,7 @@ def encounter_graph(spec):
     return molecule, source
 
 
-def sample_encounter(spec, *, n=10, seed=12345):
+def sample_encounter(spec, *, n=10, seed=12345, prune_rmsd=0.5):
     """Sample native noncovalent contact modes without adding a substrate–metal bond."""
     molecule, source = encounter_graph(spec)
     modes = rxembed.nci_modes(molecule, kinds=('HB', 'CHPI', 'HBPI', 'ANPI', 'CATLP'),
@@ -51,8 +52,7 @@ def sample_encounter(spec, *, n=10, seed=12345):
             # Several modes can fail: retain the others and request enough seeds
             # for ten total final jobs even when only one mode survives.
             embedded = rxembed.embed(source, contacts=contact, n=n, seed=seed + index, threads=1)
-            ensembles = [embedded] if hasattr(embedded, 'restored_mol') else list(embedded)
-            batches.append([ensemble.restored_mol(cid) for ensemble in ensembles for cid in ensemble.ids])
+            batches.append([mol for batch in embedded_conformers(embedded, prune_rmsd) for mol in batch])
         except (ValueError, RuntimeError, TimeoutError) as exc:
             failures.append(str(exc))
             batches.append([])
@@ -66,11 +66,9 @@ def sample_encounter(spec, *, n=10, seed=12345):
                         or Chem.GetFormalCharge(geometry) != spec['charge']):
                     raise ValueError('Encounter embedding changed atom inventory, order or charge')
                 conformers.append(geometry)
-                if len(conformers) == n:
-                    return molecule, conformers
     if not conformers and failures:
         raise ValueError('All encounter contact modes failed: ' + '; '.join(failures))
-    return molecule, conformers
+    return molecule, prune_conformers(conformers, prune_rmsd)[:n]
 
 
 def uncoordinated_substrate(molecule):
@@ -276,8 +274,8 @@ def requeue_filtered_encounters(root, *, ligand_id=None):
 
 
 def add_encounter_references(links, jobs):
-    from hpc_singlepoint import selected_jobs
-    minima = {(r['ligand_id'], r['binding_permutation']): r for r in selected_jobs(jobs)}
+    from hpc_singlepoint import lowest_jobs
+    minima = {(r['ligand_id'], r['binding_permutation']): r for r in lowest_jobs(jobs)}
     requested = {(r['ligand_id'], r['binding_permutation']) for r in jobs}
     result = []
     for link in links:

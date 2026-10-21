@@ -72,7 +72,7 @@ def main(argv=None):
     parser.add_argument("--ligands-csv", type=Path, default=Path("ligands.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
     parser.add_argument("--xtb", default=os.environ.get("XTB_EXE", "xtb"))
-    parser.add_argument("--conformers", type=int, default=3)
+    parser.add_argument("--conformers", type=int, default=20)
     parser.add_argument("--coembed-conformers", type=int, default=10)
     parser.add_argument("--workers", type=int, help="Default: one worker per ligand")
     args = parser.parse_args(argv)

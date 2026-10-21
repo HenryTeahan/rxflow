@@ -18,6 +18,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 from rdkit import Chem
 import rxembed
 
+from conformer_sampling import embedded_conformers
 from rxflow import HARTREE_TO_KCAL, ligand_directory, run_gxtb
 
 
@@ -144,7 +145,7 @@ def connectivity_changes(mol, reference, *, distance_change=CONNECTIVITY_DISTANC
             "distance_changes": distance_changes}
 
 
-def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=3, seed=12345):
+def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=20, seed=12345):
     """Optimize and filter conformers, then retain valid minima within 3 kcal/mol."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -152,9 +153,9 @@ def optimize_minima(isomer, output, executable, *, prefix="endpoint", n=3, seed=
         raise FileExistsError(f"Minimum sampling {prefix} already exists in {output}; choose another prefix")
     ensemble = rxembed.embed(isomer, n=n, seed=seed, threads=1)
     records, accepted = [], []
-    for index, cid in enumerate(ensemble.ids):
+    conformers = [mol for batch in embedded_conformers(ensemble) for mol in batch]
+    for index, geometry in enumerate(conformers):
         try:
-            geometry = ensemble.restored_mol(cid)
             energy, optimized = run_gxtb(geometry, output, executable, optimize=True,
                                          name=f"{prefix}_conformer_{index + 1:03d}")
             changes = connectivity_changes(optimized, geometry)
@@ -425,7 +426,7 @@ def generate_ts_guess(reactant, product, output, *, prefix="reaction", n=10, see
     return selection
 
 
-def sample_reaction_endpoints(pair, output, executable, *, pair_index=1, n=3, coembed_conformers=10,
+def sample_reaction_endpoints(pair, output, executable, *, pair_index=1, n=20, coembed_conformers=10,
                               seed=12345, stage="all", method="r2SCAN-3c"):
     """Sample minima and the lowest-TS-RMSD reactive pair into one ligand directory."""
     output = Path(output)
@@ -466,7 +467,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pairs_csv", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("results"))
-    parser.add_argument("--conformers", type=int, default=3, help="Minimum conformers per endpoint")
+    parser.add_argument("--conformers", type=int, default=20, help="Requested conformers per endpoint, before pruning")
     parser.add_argument("--coembed-conformers", type=int, default=10)
     parser.add_argument("--max-pairs", type=int)
     parser.add_argument("--stage", choices=("all", "minima", "ts"), default="all")

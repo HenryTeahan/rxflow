@@ -15,6 +15,7 @@ import sys
 from rdkit import Chem
 import rxembed
 
+from conformer_sampling import embedded_conformers
 from hpc_workflow import claim_job, connect_database, run_job, update_job
 from rxflow import ligand_directory, read_ligands
 from rxflow_endpoints import mapped_molecule
@@ -326,24 +327,24 @@ def precursor_graph(spec):
     return molecule, source
 
 
-def sample_precursor(spec, *, n=10, seed=12345):
+def sample_precursor(spec, *, n=10, seed=12345, prune_rmsd=0.5):
     """Freshly embed n total conformers; retain each successful stereo ensemble fairly."""
     if spec["endpoint"] == "encounter":
         from hpc_encounters import sample_encounter
-        return sample_encounter(spec, n=n, seed=seed)
+        return sample_encounter(spec, n=n, seed=seed, prune_rmsd=prune_rmsd)
     molecule, source = precursor_graph(spec)
     if spec.get("reference_name"):
-        # Tiny acid/base molecules otherwise collapse to one seed under RMS pruning.
+        # Request the full seed budget; the explicit prism step removes duplicates.
         embedded = rxembed.embed(source, n=n, params=rxembed.EmbedParams(seed=seed, threads=1, prune_rms=-1))
     else:
         embedded = rxembed.embed(source, n=n, seed=seed, threads=1)
-    ensembles = [embedded] if hasattr(embedded, "restored_mol") else list(embedded)
+    batches = embedded_conformers(embedded, prune_rmsd)
     # Round-robin across undefined ligand stereo alternatives, without discarding one hand.
     conformers = []
-    for rank in range(max((len(ensemble.ids) for ensemble in ensembles), default=0)):
-        for ensemble in ensembles:
-            if rank < len(ensemble.ids):
-                geometry = ensemble.restored_mol(ensemble.ids[rank])
+    for rank in range(max(map(len, batches), default=0)):
+        for batch in batches:
+            if rank < len(batch):
+                geometry = batch[rank]
                 if Chem.GetFormalCharge(geometry) != spec["charge"]:
                     raise ValueError("Embedding returned a precursor with the wrong total charge")
                 if [a.GetAtomicNum() for a in geometry.GetAtoms()] != [a.GetAtomicNum() for a in molecule.GetAtoms()]:
@@ -406,8 +407,10 @@ def species_protocol(config, plan, links, conformers):
     settings = {key: value for key, value in config["calculation"].items() if key != "max_iterations"}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
     seed = config.get("sampling", {}).get("seed", 12345)
+    sampling = config.get("sampling", {})
     protocol = json.dumps(dict(version=1, conformers=conformers, seed=seed, settings=settings, plan=plan,
-                               links=links), sort_keys=True)
+                               links=links, **({"prune_rmsd": sampling["prune_rmsd"]}
+                                              if sampling.get("prune_rmsd", 0.5) != 0.5 else {})), sort_keys=True)
     return settings, seed, protocol
 
 
@@ -418,6 +421,7 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
     connection = connect_precursors(root / database_name, bound=bound, encounter=encounter)
     added = repaired = 0
     errors = []
+    sampling_records = []
     try:
         frozen = connection.execute("SELECT value FROM precursor_metadata WHERE key='protocol'").fetchone()
         if frozen and frozen[0] != protocol:
@@ -443,24 +447,32 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
             molecule, _ = precursor_graph(spec)
             geometries, error = [], None
             try:
-                molecule, geometries = sample_precursor(spec, n=conformers, seed=seed)
+                pruning = config.get("sampling", {}).get("prune_rmsd", 0.5)
+                molecule, geometries = sample_precursor(spec, n=conformers, seed=seed, prune_rmsd=pruning)
+                if not geometries:
+                    raise ValueError("No precursor conformers survived embedding and pruning")
             except (ValueError, RuntimeError, TimeoutError) as exc:
                 error = str(exc)
+            sampling_records.append(dict(ligand_id=spec["ligand_id"], endpoint=spec["endpoint"],
+                pair_index=spec["pair_index"] if bound else spec["binding_permutation"],
+                seating=spec["seating"] if bound else spec["protonation_site"],
+                requested=conformers, retained=len(geometries), error=error))
             smiles = Chem.MolToSmiles(molecule)
             for conformer in needed:
                 relative = precursor_location(spec, conformer)
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 valid = conformer <= len(geometries)
-                detail = None if valid else (error or f"Only {len(geometries)} of {conformers} precursor conformers embedded")
+                detail = None if valid or error is None else error
                 if valid:
                     text = Chem.MolToXYZBlock(geometries[conformer - 1])
                     if target.exists() and target.read_text() != text:
                         raise ValueError(f"Existing precursor seed differs: {target}")
                     if not target.exists():
                         target.write_text(text)
-                values = dict(status="pending" if valid else "failed", stage="opt" if valid else "sampling",
-                              error=None if valid else f"Precursor embedding failed: {detail}")
+                values = dict(status="pending" if valid else ("failed" if error else "skipped"),
+                              stage="opt" if valid else ("sampling" if error else "pruned"),
+                              error=f"Precursor embedding failed: {detail}" if detail else None)
                 if conformer in previous:
                     update_job(connection, previous[conformer]["id"], **values)
                     repaired += int(valid)
@@ -481,7 +493,7 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
                     errors.append(dict(ligand_id=spec["ligand_id"], binding_permutation=spec["binding_permutation"],
                                        state=spec["endpoint"], conformer=conformer, error=detail))
         summary = dict(species=len(plan), conformers_per_species=conformers, added=added, repaired=repaired,
-                       errors=errors, plan=plan, links=links)
+                       errors=errors, sampling=sampling_records, plan=plan, links=links)
         summary_name = "encounters.json" if encounter else ("acid_base.json" if bound else ("references.json" if reference else "precursors.json"))
         (root / summary_name).write_text(json.dumps(summary, indent=2) + "\n")
         return summary
@@ -648,6 +660,8 @@ def submit_precursors(config_path, config, *, workers=100, conformers=10, accoun
         plan += encounter_plan(config, base, root)
     command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve()), workflow])
     wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
+    logs = base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
     common = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL",
               f"--mem={config['calculation']['memory_mb']}", "--time=24:00:00"]
     for flag, value in (("account", account), ("partition", partition)):
@@ -656,7 +670,8 @@ def submit_precursors(config_path, config, *, workers=100, conformers=10, accoun
 
     def submit(stage, *, cpus=1, dependency=None, array=None):
         args = [*common, f"--job-name=rxflow-{workflow}-{stage}", f"--cpus-per-task={cpus}",
-                f"--output={base / (workflow + '-' + stage + '-%A_%a.out')}"]
+                f"--output={logs / (workflow + '-' + stage + '-%A_%a.out')}",
+                f"--error={logs / (workflow + '-' + stage + '-%A_%a.err')}"]
         if dependency:
             args.append(f"--dependency=afterok:{dependency}")
         if array:

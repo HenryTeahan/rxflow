@@ -15,9 +15,10 @@ from unittest.mock import patch
 from hpc_precursors import connect_precursors, load_diagram_inputs
 from hpc_singlepoint import (METHOD, calculation_settings, claim_singlepoint, connect_singlepoints,
                             handle_singlepoints, mpi_executable, plan_singlepoints, prepare_singlepoints, read_jobs, run_singlepoint,
-                            submit_singlepoints)
+                            selected_jobs, submit_singlepoints)
 from hpc_workflow import connect_database
 from orca_hpc import collect_singlepoint, orca_input
+from rxflow import HARTREE_TO_KCAL
 
 XYZ = "3\nsource geometry\nO 0 0 0\nH 0.9572 0 0\nH -0.239 0.927 0\n"
 SMILES = "[O:1]([H:2])[H:3]"
@@ -115,6 +116,69 @@ class SinglepointTests(unittest.TestCase):
                 self.assertNotIn('ExtOpt', text)
                 self.assertNotIn('NumFreq', text)
                 self.assertNotIn('%geom', text)
+
+    def test_ts_window_uses_numfreq_gibbs_and_includes_boundary_per_group(self):
+        for identifier, relative, status in ((6, 1., 'succeeded'), (7, 3., 'succeeded'),
+                                             (8, 3.001, 'succeeded'), (9, -100., 'failed')):
+            self.add(self.reaction, identifier, 'TS', -10. + relative / HARTREE_TO_KCAL,
+                     -100. - identifier, conformer=identifier, retained=0, status=status)
+        # A much lower TS in another pathway must not eliminate this group's seeds.
+        self.add(self.reaction, 10, 'TS', -20., -21., pair=2)
+        selected = selected_jobs(read_jobs(self.reaction))
+        ts = [row for row in selected if row['endpoint'] == 'TS']
+        self.assertEqual([row['id'] for row in ts], [3, 6, 7, 10])
+        plan = self.prepare()
+        self.assertEqual(plan['ts_energy_window_kcal'], 3.)
+        self.assertEqual(plan['added'], 11)
+        queued = [row['source_job_id'] for row in read_jobs(self.root / 'singlepoints.sqlite')
+                  if row['endpoint'] == 'TS']
+        self.assertEqual(queued, [3, 6, 7, 10])
+        self.assertEqual(self.prepare()['added'], 0)
+
+    def test_dft_waits_for_entire_ts_window_and_can_change_selected_ts(self):
+        self.add(self.reaction, 6, 'TS', -10. + 2. / HARTREE_TO_KCAL, -10.15,
+                 conformer=-2, retained=0)
+        self.prepare()
+        self.finish()
+        with closing(connect_singlepoints(self.root / 'singlepoints.sqlite')) as db:
+            db.execute("UPDATE jobs SET status='pending' WHERE source_kind='reaction' AND source_job_id=6")
+        partial = self.load()
+        self.assertEqual(partial['singlepoint_summary']['ready'], 8)
+        self.assertEqual(partial['singlepoint_summary']['selected_states'], 9)
+        self.assertEqual(partial['singlepoint_summary']['active_mode'], 'gxtb')
+        self.finish()
+        result = self.load()
+        self.assertEqual(result['singlepoint_summary']['active_mode'], 'dft')
+        ts = [row for row in result['jobs'] if row['endpoint'] == 'TS']
+        self.assertEqual({row['id'] for row in ts if row['singlepoint_selected']}, {3, 6})
+        best = min(ts, key=lambda row: row['gibbs_free_energy_eh'])
+        self.assertEqual(best['id'], 6)
+        self.assertAlmostEqual(result['diagram_references'][0]['TS_with_acid_gibbs_eh'],
+                               best['gibbs_free_energy_eh'] + result['reference_minima']['acetic_acid']['gibbs_free_energy_eh'])
+
+    def test_new_lower_ts_skips_pending_outside_window_and_can_reactivate_it(self):
+        self.prepare()
+        self.add(self.reaction, 6, 'TS', -10. - 4. / HARTREE_TO_KCAL, -10.15, conformer=-2)
+        prepared = self.prepare()
+        self.assertEqual(prepared['skipped'], 1)
+        rows = [row for row in read_jobs(self.root / 'singlepoints.sqlite') if row['endpoint'] == 'TS']
+        self.assertEqual({row['source_job_id']: row['status'] for row in rows}, {3: 'skipped', 6: 'pending'})
+        with closing(connect_database(self.reaction)) as db:
+            db.execute("UPDATE jobs SET status='failed' WHERE id=6")
+        prepared = self.prepare()
+        self.assertEqual(prepared['reactivated'], 1)
+        rows = [row for row in read_jobs(self.root / 'singlepoints.sqlite') if row['endpoint'] == 'TS']
+        self.assertEqual({row['source_job_id']: row['status'] for row in rows}, {3: 'pending', 6: 'skipped'})
+
+    def test_completed_dft_is_preserved_when_ts_moves_outside_window(self):
+        self.prepare()
+        self.finish()
+        before = next(row for row in read_jobs(self.root / 'singlepoints.sqlite')
+                      if row['endpoint'] == 'TS')
+        self.add(self.reaction, 6, 'TS', -10. - 4. / HARTREE_TO_KCAL, -10.15, conformer=-2)
+        self.prepare()
+        after = next(row for row in read_jobs(self.root / 'singlepoints.sqlite') if row['id'] == before['id'])
+        self.assertEqual(after, before)
 
     def test_singlepoint_input_has_exact_requested_method_and_preserves_charge_and_spin(self):
         text = orca_input(XYZ, 'singlepoint', -1, 1, calculation_settings(self.config))

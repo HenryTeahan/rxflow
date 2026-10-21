@@ -7,6 +7,7 @@ from contextlib import closing
 import csv
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -48,15 +49,29 @@ def connect_database(path):
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(ligand_id,pair_index,seating,endpoint,conformer))""")
     # Upgrade already prepared databases without replacing rows or calculated results.
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
-    for name, kind in {"substrate": "TEXT", "binding_permutation": "INTEGER",
+    migrations = {"substrate": "TEXT", "binding_permutation": "INTEGER",
                        "binding_mode": "INTEGER", "coordination_isomer": "INTEGER",
                        "donor_maps": "TEXT", "substrate_site": "INTEGER", "resonance": "INTEGER",
                        "ts_rmsd": "REAL", "ts_strategy": "TEXT", "ts_mode_status": "TEXT",
                        "ts_mode_fingerprint": "TEXT", "ts_mode_json": "TEXT",
-                       "ts_mode_recovery": "TEXT", "ts_guess_json": "TEXT", "ts_scan_json": "TEXT"}.items():
-        if name not in columns:
-            connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
+                       "ts_mode_recovery": "TEXT", "ts_guess_json": "TEXT", "ts_scan_json": "TEXT",
+                       "ts_parent_id": "INTEGER", "ts_sampling_json": "TEXT"}
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+    if migrations.keys() - columns:
+        # Many resumed workers can discover the old schema together. Reserve
+        # the writer first, then reread: another worker may have upgraded it
+        # while this connection waited. All columns become visible together.
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(jobs)")}
+            for name, kind in migrations.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            connection.close()
+            raise
     return connection
 
 
@@ -125,7 +140,11 @@ def prepare_jobs(connection, source, root, settings):
         for role in ("reactant", "product"):
             available = [int(re.search(r"conformer_(\d+)_input", path.name)[1])
                          for path in (descriptor.parent / role).glob(f"{prefix}_conformer_*_input.xyz")]
-            count = max(summary.get("endpoint_conformers", 1), max(available, default=1))
+            sampled = next((record for record in summary.get("endpoint_sampling", [])
+                            if (record["pair"], record["seating"], record["endpoint"]) ==
+                            (pair, seating, role)), None)
+            count = (max(1, sampled["retained"]) if sampled is not None else
+                     max(summary.get("endpoint_conformers", 1), max(available, default=1)))
             inputs.extend((role, conformer, descriptor.parent / role / f"{prefix}_conformer_{conformer:03d}_input.xyz")
                           for conformer in range(1, count + 1))
         candidates = selection.get("candidates", [])
@@ -190,7 +209,7 @@ def prepare_jobs(connection, source, root, settings):
     return added, groups
 
 
-def claim_job(connection):
+def claim_job(connection, sampling=None):
     """Claim ready jobs; NEB waits for all TS candidates and runs only if none succeeded."""
     connection.execute("BEGIN IMMEDIATE")
     try:
@@ -198,6 +217,34 @@ def claim_job(connection):
             updated_at=CURRENT_TIMESTAMP WHERE j.status='pending' AND j.ts_strategy='neb'
             AND EXISTS (SELECT 1 FROM jobs t WHERE t.ligand_id=j.ligand_id AND t.pair_index=j.pair_index
               AND t.seating=j.seating AND t.endpoint='TS' AND t.status='succeeded')""")
+        if sampling is not None:
+            # A reserved negative conformer is a sampling task, not a calculated
+            # TS. The group key makes claiming this task safe across workers.
+            parents = connection.execute("""SELECT t.* FROM jobs t WHERE t.endpoint='TS'
+                AND t.status='succeeded' AND t.ts_mode_status='passed' AND t.imaginary_count=1
+                AND t.gibbs_free_energy_eh IS NOT NULL AND t.xyz_file IS NOT NULL AND t.ts_parent_id IS NULL
+                AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.ligand_id=t.ligand_id
+                  AND j.pair_index=t.pair_index AND j.seating=t.seating AND j.endpoint='TS'
+                  AND (j.conformer=-1 OR j.status IN ('pending','running')))
+                AND t.id=(SELECT s.id FROM jobs s WHERE s.ligand_id=t.ligand_id
+                  AND s.pair_index=t.pair_index AND s.seating=t.seating AND s.endpoint='TS'
+                  AND s.status='succeeded' AND s.ts_mode_status='passed' AND s.imaginary_count=1
+                  AND s.gibbs_free_energy_eh IS NOT NULL AND s.xyz_file IS NOT NULL AND s.ts_parent_id IS NULL
+                  ORDER BY s.gibbs_free_energy_eh,s.id LIMIT 1)""").fetchall()
+            copied = ("ligand_id", "pair_index", "seating", "smiles", "charge", "multiplicity",
+                      "donor", "hydrogen", "acceptor", "settings_json", "substrate",
+                      "binding_permutation", "binding_mode", "coordination_isomer", "donor_maps",
+                      "substrate_site", "resonance")
+            for parent in parents:
+                protocol = dict(requested=sampling.get("ts_conformers", 20),
+                                prune_rmsd=sampling.get("prune_rmsd", 0.5),
+                                seed=(sampling.get("seed", 12345) + 1009 * parent["id"]) % 2147483647,
+                                parent_job_id=parent["id"], parent_xyz=parent["xyz_file"])
+                columns = (*copied, "endpoint", "conformer", "input_xyz", "stage", "ts_strategy",
+                           "ts_parent_id", "ts_sampling_json")
+                connection.execute(f"INSERT INTO jobs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                    (*[parent[name] for name in copied], "TS", -1, parent["xyz_file"], "ts_sampling", "sampling",
+                     parent["id"], json.dumps(protocol, sort_keys=True)))
         job = connection.execute("""UPDATE jobs SET status='running',attempt=attempt+1,error=NULL,
             worker_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=(
               SELECT j.id FROM jobs j WHERE j.status='pending' AND (j.endpoint!='TS' OR NOT EXISTS (
@@ -211,6 +258,48 @@ def claim_job(connection):
             (os.environ.get("SLURM_JOB_ID", "local") + f":{os.getpid()}",)).fetchone()
         connection.commit()
         return dict(job) if job else None
+    except BaseException:
+        connection.rollback()
+        raise
+
+
+def run_ts_sampling(connection, job, root):
+    """Publish one batch of pruned TS seeds atomically, preserving the parent TS."""
+    from hpc_sampling import sample_transition_state
+
+    protocol = json.loads(job["ts_sampling_json"])
+    conformers, report = sample_transition_state(job, (root / job["input_xyz"]).read_text(),
+        n=protocol["requested"], seed=protocol["seed"], max_rmsd=protocol["prune_rmsd"])
+    report = {**protocol, **report}
+    update_job(connection, job["id"], ts_sampling_json=json.dumps(report, sort_keys=True))
+    if not conformers:
+        raise ValueError("No TS conformers survived embedding and RMSD pruning")
+    folder = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_ts_sampling"
+    folder.mkdir(parents=True, exist_ok=True)
+    inputs = []
+    for rank, mol in enumerate(conformers, 1):
+        path = folder / f"conformer_{rank:03d}_input.xyz"
+        text = Chem.MolToXYZBlock(mol)
+        if path.exists() and path.read_text() != text:
+            raise ValueError(f"Existing TS sampling seed differs: {path}")
+        if not path.exists():
+            path.write_text(text)
+        inputs.append(str(path.relative_to(root)))
+    report["input_files"] = inputs
+    (folder / "sampling.json").write_text(json.dumps(report, indent=2) + "\n")
+    copied = ("ligand_id", "pair_index", "seating", "endpoint", "smiles", "charge", "multiplicity",
+              "donor", "hydrogen", "acceptor", "settings_json", "substrate", "binding_permutation",
+              "binding_mode", "coordination_isomer", "donor_maps", "substrate_site", "resonance", "ts_parent_id")
+    columns = (*copied, "conformer", "input_xyz", "ts_strategy", "ts_sampling_json")
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        for rank, path in enumerate(inputs, 1):
+            connection.execute(f"INSERT INTO jobs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+                (*[job[name] for name in copied], -1 - rank, path, "sampled", json.dumps(report, sort_keys=True)))
+        # A sampling task has no energy or frequency result and is never selected as a TS.
+        update_job(connection, job["id"], status="skipped", stage="complete", retained=0,
+                   ts_sampling_json=json.dumps(report, sort_keys=True))
+        connection.commit()
     except BaseException:
         connection.rollback()
         raise
@@ -379,7 +468,7 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
     """Preoptimize TS guesses, try OptTS, and prepare coembedded endpoints for NEB."""
     settings = {**json.loads(job["settings_json"]), **executables}
     settings.setdefault("opt_attempts", settings.get("ts_attempts", 2))
-    scan_recovery = settings.get("ts_scan_recovery", True)
+    scan_recovery = settings.get("ts_scan_recovery", True) and job.get("ts_strategy") != "sampled"
     scan_report = None
 
     def score_guess():
@@ -468,6 +557,9 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
                                     molecule_with_xyz(endpoint_job["smiles"], reference))
 
     try:
+        if job.get("ts_strategy") == "sampling":
+            run_ts_sampling(connection, job, root)
+            return
         if job["endpoint"] == "TS" and job["stage"] == "ts_guess":
             job = regenerate_ts_guess(connection, job, root, source, sampling or {})
         original = (root / job["input_xyz"]).read_text()
@@ -518,7 +610,7 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
             if frequency_result is None:
                 # Modern candidates share one group-level NEB job, claimed only
                 # after every candidate fails. Historical jobs use inline NEB.
-                if strategy == "direct" or not settings["neb_fallback"]:
+                if strategy in ("direct", "sampled") or not settings["neb_fallback"]:
                     raise failure or RuntimeError("OptTS attempts did not converge")
                 if scan_recovery:
                     if scan_report is None:
@@ -744,7 +836,8 @@ def reset_failed_transition_states(root, *, dry_run=False):
                 current = connection.execute("SELECT status,attempt FROM jobs WHERE id=?", (row["id"],)).fetchone()
                 if tuple(current) != ("failed", row["attempt"]):
                     continue
-                stage = ("ts_guess" if row["stage"] == "ts_guess" else
+                stage = ("ts_sampling" if row["ts_strategy"] == "sampling" else
+                         "ts_guess" if row["stage"] == "ts_guess" else
                          "neb" if row["ts_strategy"] == "neb" else "opt")
                 update_job(connection, row["id"], status="pending", stage=stage, error=None,
                            worker_id=None, retained=None, electronic_energy_eh=None,
@@ -811,6 +904,8 @@ def submit_workflow(config_path, config, *, workers=100, conformers=10, account=
             raise ValueError("Choose fresh source/results directories for submit; use resume for prepared jobs")
     command = shlex.join([sys.executable, "-m", "hpc_workflow", "--config", str(config_path.resolve())])
     wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
+    logs = base / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
     common = ["sbatch", "--parsable", f"--chdir={base}", "--export=ALL",
               f"--mem={config['calculation']['memory_mb']}", "--time=24:00:00"]
     for flag, value in (("account", account), ("partition", partition)):
@@ -819,7 +914,8 @@ def submit_workflow(config_path, config, *, workers=100, conformers=10, account=
 
     def submit(name, stage, *, cpus=1, dependency=None, dependency_type="afterok", array=None):
         args = [*common, f"--job-name=rxflow-{name}", f"--cpus-per-task={cpus}",
-                f"--output={base / (name + '-%A_%a.out')}"]
+                f"--output={logs / (name + '-%A_%a.out')}",
+                f"--error={logs / (name + '-%A_%a.err')}"]
         if dependency:
             args.append(f"--dependency={dependency_type}:{dependency}")
         if array:
@@ -883,6 +979,15 @@ def main(argv=None):
     for key in ("cpus", "memory_mb", "opt_attempts", "ts_attempts", "timeout_seconds"):
         if settings[key] <= 0:
             parser.error(f"calculation.{key} must be positive")
+    sampling = config.get("sampling", {})
+    for key, default in (("endpoint_conformers", 20), ("coembed_conformers", 10),
+                         ("ts_candidates", 5), ("ts_conformers", 20)):
+        value = sampling.get(key, default)
+        if type(value) is not int or value < 1:
+            parser.error(f"sampling.{key} must be a positive integer")
+    rmsd = sampling.get("prune_rmsd", 0.5)
+    if not isinstance(rmsd, (int, float)) or not math.isfinite(rmsd) or rmsd <= 0:
+        parser.error("sampling.prune_rmsd must be finite and positive")
     if args.command == "singlepoint":
         from hpc_singlepoint import handle_singlepoints
 
@@ -943,9 +1048,6 @@ def main(argv=None):
                 parser.error("--ligand-index is outside the CSV row range")
             rows = [rows[args.ligand_index]]
         sampling = config.get("sampling", {})
-        if any(sampling.get(key, default) < 1 for key, default in (
-            ("endpoint_conformers", 3), ("coembed_conformers", 10), ("ts_candidates", 5))):
-            parser.error("Sampling conformer counts must be positive")
         source = (base / config["paths"]["source"]).resolve()
         for row in rows:
             print(sample_ligand(row, ligand_directory(source, row["ID"]), executables["xtb_exe"], **sampling), flush=True)
@@ -956,7 +1058,7 @@ def main(argv=None):
             print("New jobs, reaction/seating groups:", prepare_jobs(connection,
                 (base / config["paths"]["source"]).resolve(), root, settings))
         elif args.command == "worker":
-            while (job := claim_job(connection)) is not None:
+            while (job := claim_job(connection, config.get("sampling", {}))) is not None:
                 print(f"Job {job['id']}: ligand {job['ligand_id']} {job['endpoint']}", flush=True)
                 run_job(connection, job, root, executables,
                         source=(base / config["paths"]["source"]).resolve(), sampling=config.get("sampling", {}))
@@ -966,7 +1068,7 @@ def main(argv=None):
             row = connection.execute("SELECT stage FROM jobs WHERE id=?", (args.id,)).fetchone()
             if row and row["stage"] == "sampling":
                 parser.error("Sampling failures need corrected seeds followed by prepare; they cannot be retried as ORCA jobs")
-            connection.execute("UPDATE jobs SET status='pending',stage=CASE WHEN stage='ts_guess' THEN 'ts_guess' ELSE 'opt' END,error=NULL,retained=NULL,"
+            connection.execute("UPDATE jobs SET status='pending',stage=CASE WHEN ts_strategy='sampling' THEN 'ts_sampling' WHEN stage='ts_guess' THEN 'ts_guess' ELSE 'opt' END,error=NULL,retained=NULL,"
                                "electronic_energy_eh=NULL,gibbs_free_energy_eh=NULL,frequencies_json=NULL,"
                                "imaginary_count=NULL,xyz_file=NULL,out_file=NULL,worker_id=NULL,ts_scan_json=NULL "
                                "WHERE id=? AND status IN ('failed','running')", (args.id,))

@@ -1,7 +1,7 @@
 """Generate mapped reaction pairs following reaction_smarts.ipynb.
 
 Keep explicit hydrogens and stable atom maps for later coembedding and TS work.
-The original reaction_workflow.py is retained as a reference.
+The original workflow is retained in legacy/reaction_workflow.py as a reference.
 """
 
 from __future__ import annotations
@@ -209,7 +209,7 @@ def create_products(reactant, metal):
                 yield resonance, acceptor, product
 
 
-def generate_reaction_pairs(row, output, *, executable=None, enumerate_only=False, seed=12345):
+def generate_reaction_pairs(row, output, *, executable=None, enumerate_only=False, seed=12345, prune_rmsd=0.5):
     """Generate mapped pairs for one ligand, filtering scored isomers at 20 kcal/mol."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -231,9 +231,11 @@ def generate_reaction_pairs(row, output, *, executable=None, enumerate_only=Fals
             for isomer_index, isomer in enumerate(isomers):
                 try:
                     ensemble = rxembed.embed(isomer, n=1, seed=seed, threads=1)
-                    geometry = ensemble.mol
-                    if geometry.GetNumConformers() == 0:
+                    from conformer_sampling import embedded_conformers
+                    conformers = [mol for batch in embedded_conformers(ensemble, prune_rmsd) for mol in batch]
+                    if not conformers:
                         raise ValueError("Embedding produced no conformer")
+                    geometry = conformers[0]
                     energy, _ = run_gxtb(geometry, output / "coordination", executable,
                                          name=f"mode_{mode_index + 1:02d}_isomer_{isomer_index + 1:02d}")
                     modes.append((mode_index, donors, isomer_index, energy, mol, rxembed.cxsmiles(isomer)))

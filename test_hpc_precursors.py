@@ -70,7 +70,7 @@ class PrecursorTests(unittest.TestCase):
                 smiles = rxembed.cxsmiles(rxembed.Isomer(mol, 'spl', slots))
                 db.execute('UPDATE jobs SET smiles=? WHERE pair_index=?', (smiles, pair))
 
-    def fresh_sample(self, spec, *, n, seed):
+    def fresh_sample(self, spec, *, n, seed, prune_rmsd=0.5):
         molecule, source = precursor_graph(spec)
         self.assertEqual(molecule.GetNumConformers(), 0)
         geometries = []
@@ -110,7 +110,7 @@ class PrecursorTests(unittest.TestCase):
                 return geometries[cid]
         with patch('hpc_precursors.rxembed.embed', return_value=Ensemble()) as embed:
             graph, results = sample_precursor(spec)
-        self.assertEqual(len(results), 10)
+        self.assertEqual(len(results), 1)  # The fixture repeats the same geometry ten times.
         self.assertEqual(embed.call_args.kwargs, dict(n=10, seed=12345, threads=1))
         self.assertEqual(graph.GetNumConformers(), 0)
         self.assertEqual(embed.call_args.args[0].mol.GetNumConformers(), 0)
@@ -153,19 +153,20 @@ class PrecursorTests(unittest.TestCase):
             energies = c.execute('SELECT * FROM precursor_diagram_references').fetchall()
             self.assertTrue(all(r['deprotonated_complex_plus_substrate_eh'] is None for r in energies))
 
-    def test_partial_embedding_records_missing_seeds_and_can_repair_them(self):
-        def partial(spec, *, n, seed):
+    def test_pruned_embedding_skips_unused_slots_and_does_not_reembed_on_resume(self):
+        def partial(spec, *, n, seed, prune_rmsd=0.5):
             mol, geometries = self.fresh_sample(spec, n=n, seed=seed)
             return mol, geometries[:9]
         with patch('hpc_precursors.sample_precursor', side_effect=partial):
             result = prepare_precursors(self.config, self.base, self.root)
-        self.assertEqual(len(result['errors']), 3)
+        self.assertEqual(result['errors'], [])
         with closing(connect_precursors(self.root / 'precursors.sqlite')) as c:
-            self.assertEqual(c.execute("SELECT count(*) FROM jobs WHERE stage='sampling'").fetchone()[0], 3)
-        repaired, embed = self.prepare()
-        self.assertEqual(repaired['repaired'], 3)
+            self.assertEqual(c.execute("SELECT count(*) FROM jobs WHERE stage='pruned' AND status='skipped'").fetchone()[0], 3)
+        with patch('hpc_precursors.sample_precursor', side_effect=AssertionError('Must not reembed')):
+            repeated = prepare_precursors(self.config, self.base, self.root)
+        self.assertEqual(repeated['repaired'], 0)
         with closing(connect_precursors(self.root / 'precursors.sqlite')) as c:
-            self.assertEqual(c.execute("SELECT count(*) FROM jobs WHERE status='pending'").fetchone()[0], 30)
+            self.assertEqual(c.execute("SELECT count(*) FROM jobs WHERE status='pending'").fetchone()[0], 27)
 
     def test_lowest_gibbs_ignores_retained_filter_and_does_not_merge_resonance_routes(self):
         self.prepare()
@@ -273,11 +274,11 @@ class PrecursorTests(unittest.TestCase):
         self.assertEqual(Chem.GetFormalCharge(prot) + Chem.GetFormalCharge(acetate), 1)
         self.assertEqual(Chem.GetFormalCharge(deprot) + Chem.GetFormalCharge(acid), 1)
 
-    def test_acid_base_real_sampling_keeps_requested_conformers(self):
+    def test_acid_base_real_sampling_prunes_duplicate_conformers(self):
         for spec in acid_base_plan():
             with self.subTest(spec=spec['reference_name']):
                 molecule, conformers = sample_precursor(spec, n=10, seed=12345)
-                self.assertEqual(len(conformers), 10)
+                self.assertEqual(len(conformers), 1)
                 self.assertEqual(molecule.GetNumConformers(), 0)
                 self.assertTrue(all(Chem.GetFormalCharge(m) == spec['charge'] for m in conformers))
 
@@ -498,7 +499,7 @@ class PrecursorTests(unittest.TestCase):
         with patch('hpc_encounters.rxembed.nci_modes', return_value={'bad': object(), 'good': object()}), \
                 patch('hpc_encounters.rxembed.embed', side_effect=[ValueError('bad contact'), ensemble]) as embed:
             result, conformers = sample_encounter(spec, n=2)
-        self.assertEqual(len(conformers), 2)
+        self.assertEqual(len(conformers), 1)  # The good mode's two seeds are duplicates.
         self.assertEqual(embed.call_count, 2)
         self.assertEqual(result.GetNumAtoms(), molecule.GetNumAtoms())
 

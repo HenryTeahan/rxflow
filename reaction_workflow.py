@@ -30,6 +30,7 @@ from rdkit.Chem import AllChem, rdMolAlign, rdDistGeom
 from rdkit.Geometry import Point3D
 
 import rxembed
+from conformer_sampling import prune_conformers
 from workflow_store import WorkflowStore, digest, import_ligand
 
 
@@ -447,9 +448,10 @@ def embedded_geometries(
                 result = restore_atom_order(ensemble.mol, graph)
                 if result.GetNumConformers() == 0:
                     raise ValueError("Embedding returned no conformers")
+                conformers = prune_conformers([one_conformer(result, conf.GetId())
+                                              for conf in result.GetConformers()])
                 generated = []
-                for conformer_index, conf in enumerate(result.GetConformers()):
-                    candidate = one_conformer(result, conf.GetId())
+                for conformer_index, candidate in enumerate(conformers):
                     geometry_id = recorder.record_geometry(candidate, isomer_index, conformer_index,
                                                             seed + isomer_index, generated_by=attempt) if recorder else None
                     generated.append((conformer_index, candidate, geometry_id))
