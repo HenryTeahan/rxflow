@@ -211,15 +211,21 @@ calculations are reused when you resume or prepare additional work.
 
 ```text
 rxflow/
-├── *.py                     Runtime modules and command entry points
+├── src/                     Runtime modules and command entry points
 ├── hpc.toml, ligands.csv     Example configuration and inputs
 ├── reaction_diagrams.ipynb  Results notebook
 ├── tests/                   Regression suite and CSV fixtures
 ├── scripts/                 Manual Slurm submission templates
+├── experiments/             Local investigation scripts and scratch work
 ├── logs/                    Slurm stdout and stderr (ignored by Git)
 ├── docs/                    Protocol and architecture reference
 └── legacy/                  Historical workflow reference
 ```
+
+Install the project with `uv sync --locked` after changing the source layout.
+The editable install makes the modules in `src/` available to the CLI, tests,
+notebook and Slurm workers; existing `rxflow` and `python -m hpc_workflow`
+commands work from the repository root.
 
 Run the tests from the repository root after activating the environment:
 

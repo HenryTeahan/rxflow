@@ -1088,6 +1088,21 @@ wheels = [
 ]
 
 [[package]]
+name = "prism-pruner"
+version = "0.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "networkx" },
+    { name = "numpy" },
+    { name = "scipy" },
+    { name = "tqdm" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/22/9d/660b3e6743a46ccf382d1182e3d93cfc02463d61dae608715ff79dad8655/prism_pruner-0.1.2.tar.gz", hash = "sha256:b7e81a512be61a78c492f20e5bfe9e82fa4aedc653f36ec108afab92178e96f8", size = 30005, upload-time = "2026-04-28T13:29:38.708Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b8/79/7eb34987fae388ff3447af7b996c120b0058543f952cfd2fdc243b21e8c9/prism_pruner-0.1.2-py3-none-any.whl", hash = "sha256:f859dcde6b2a949d2740068fb426311dbe3c110ab5356a3a924a7c0b645bc6b5", size = 30483, upload-time = "2026-04-28T13:29:36.157Z" },
+]
+
+[[package]]
 name = "prometheus-client"
 version = "0.26.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1406,6 +1421,7 @@ dependencies = [
     { name = "ipykernel" },
     { name = "jupyterlab" },
     { name = "nbformat" },
+    { name = "prism-pruner" },
     { name = "rxembed" },
     { name = "rxts", extra = ["ff"] },
     { name = "xyzrender" },
@@ -1417,6 +1433,7 @@ requires-dist = [
     { name = "ipykernel" },
     { name = "jupyterlab" },
     { name = "nbformat" },
+    { name = "prism-pruner", specifier = ">=0.1.2" },
     { name = "rxembed", extras = ["workflow"], git = "https://github.com/aligfellow/rxembed.git?rev=730eae5775401d337cfc7b4a770965d0eb88e1bc" },
     { name = "rxts", extras = ["ff"], git = "https://github.com/HenryTeahan/rxts.git?rev=8eac9f1b2a2d13e52b47a1438961e0fe68a45f47" },
     { name = "xyzrender", git = "https://github.com/HenryTeahan/xyzrender.git?rev=792799503b31d3a447326bc01444b074286dadb2" },
@@ -1570,6 +1587,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/56/ae/047938e828cafc8eca4c908fafb6588fee944e3af39a0af9d7b602499ae5/tornado-6.5.10-cp39-abi3-win32.whl", hash = "sha256:302eb1e0e3e159314eb591920529fdea80acca92df5510a2cec5bbd4f099ec72", size = 468387, upload-time = "2026-09-15T13:47:44.556Z" },
     { url = "https://files.pythonhosted.org/packages/d8/d4/5901517f05affd752490f6a654ba31b7474664e8dd80bd045a00c220bd88/tornado-6.5.10-cp39-abi3-win_amd64.whl", hash = "sha256:37ae8f150cecfdbf747fc4e12f5e9a97ecd8cf1d4cdb3f119e2de84b11196918", size = 468828, upload-time = "2026-09-15T13:47:45.961Z" },
     { url = "https://files.pythonhosted.org/packages/f3/1a/fd497f3a7f7b74bb04f4b94536b5c9f80742b5d50501fd27977652ddec16/tornado-6.5.10-cp39-abi3-win_arm64.whl", hash = "sha256:ce045d3c298fddd30e89a2777f97039d1b641eb9518ac7b26a4721903539c694", size = 467847, upload-time = "2026-09-15T13:47:47.283Z" },
+]
+
+[[package]]
+name = "tqdm"
+version = "4.70.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "colorama", marker = "sys_platform == 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz", hash = "sha256:cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4", size = 171846, upload-time = "2026-09-11T07:25:16.601Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a7/03/921a3d3c75785aca9ebfbfcabfbc3a1be12e2ab5265deb026d55a5a3f83e/tqdm-4.70.1-py3-none-any.whl", hash = "sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73", size = 80199, upload-time = "2026-09-11T07:25:14.599Z" },
 ]
 
 [[package]]

@@ -1,4 +1,0 @@
-sqlite3 hpc_tm_results/workflow.sqlite -cmd  "SELECT id, ligand_id, pair_index, gibbs_free_energy_eh, seating, endpoint, conformer, stage, status, worker_id
-FROM jobs
-WHERE status IN ('running', 'pending', 'succeeded', 'failed')
-ORDER BY status, id;" -csv
