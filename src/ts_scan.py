@@ -1,6 +1,7 @@
 """Score saved rxts scans and select an interior H-transfer peak for recovery."""
 
 import json
+import io
 from pathlib import Path
 import re
 import shutil
@@ -83,13 +84,14 @@ def interior_peak(frames, energies, donor, hydrogen, acceptor):
 
 def score_ts_scan(job, root, settings, source=None):
     """Preserve inputs and energy-only scores; return a checked recovery guess."""
-    from orca_hpc import molecule_with_xyz
+    from orca_hpc import molecule_with_xyz, run_orca
 
     root = Path(root)
-    folder = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_gxtb_scan"
+    method = "uma" if settings.get("method") == "uma" else "gxtb"
+    folder = root / Path(job["input_xyz"]).parent / f"job_{job['id']}_run_{job['attempt']:02d}_{method}_scan"
     folder.mkdir(exist_ok=False)
     report_file = folder / "scoring.json"
-    report = dict(valid=False, method="gxtb", solvent=None, job_id=job["id"],
+    report = dict(valid=False, method=method, solvent=None, job_id=job["id"],
                   report_file=str(report_file.relative_to(root)),
                   selection="highest_interior_local_maximum", original_input_xyz=job["input_xyz"])
     started = time.monotonic()
@@ -113,11 +115,23 @@ def score_ts_scan(job, root, settings, source=None):
         if (len(set(indices)) != 3 or any(type(i) is not int or not 0 <= i < len(symbols) for i in indices)
                 or symbols[indices[0]] != "C" or symbols[indices[1]] != "H"):
             raise ValueError("Invalid mapped C-H transfer indices for g-xTB scan scoring")
-        if settings.get("xtb_exe"):
-            rxts.set_xtb(settings["xtb_exe"])
-        scores = rxts.scoring.score(frames, method="gxtb", solvent=None,
-                                   charge=job["charge"], multiplicity=job["multiplicity"],
-                                   n_cores=settings.get("cpus", 1))
+        if method == "uma":
+            from ase.units import Hartree
+            from types import SimpleNamespace
+            energies = []
+            scan_job = {**job, "input_xyz": str((folder / "scan_input.xyz").relative_to(root))}
+            for index, frame in enumerate(frames):
+                stream = io.StringIO()
+                write(stream, frame, format="xyz")
+                result = run_orca(scan_job, root, settings, "external_sp", stream.getvalue(), attempt=index + 1)
+                energies.append(result["electronic_energy_eh"] * Hartree)
+            scores = SimpleNamespace(energies_ev=energies, failures=[], n_evaluations=len(frames), n_gradients=0)
+        else:
+            if settings.get("xtb_exe"):
+                rxts.set_xtb(settings["xtb_exe"])
+            scores = rxts.scoring.score(frames, method="gxtb", solvent=None,
+                                       charge=job["charge"], multiplicity=job["multiplicity"],
+                                       n_cores=settings.get("cpus", 1))
         report.update(energies_ev=scores.energies_ev, failures=scores.failures,
                       n_evaluations=scores.n_evaluations, n_gradients=scores.n_gradients)
         if scores.failures:
@@ -125,7 +139,7 @@ def score_ts_scan(job, root, settings, source=None):
         peak, motion = interior_peak(frames, scores.energies_ev, *indices)
         guess = folder / "guess.xyz"
         write(guess, frames[peak], format="xyz",
-              comment=f"g-xTB interior local peak, frame={peak}; charge={job['charge']} multiplicity={job['multiplicity']}")
+              comment=f"{method} interior local peak, frame={peak}; charge={job['charge']} multiplicity={job['multiplicity']}")
         report.update(valid=True, guess_xyz=str(guess.relative_to(root)), selected_frame=peak,
                       selected_energy_ev=scores.energies_ev[peak], local_motion=motion,
                       frames=len(frames))

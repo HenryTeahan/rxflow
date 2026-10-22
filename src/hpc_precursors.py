@@ -385,7 +385,8 @@ def prepare_precursors(config, base, root, *, conformers=10, reference=False, li
     summary = prepare_species(config, root, plan, links, conformers=conformers, reference=reference)
     if not reference:
         from hpc_encounters import prepare_encounters
-        summary["encounters"] = prepare_encounters(config, base, root, conformers=conformers,
+        encounter_conformers = config.get("sampling", {}).get("encounter_conformers", conformers)
+        summary["encounters"] = prepare_encounters(config, base, root, conformers=encounter_conformers,
                                                     ligand_id=ligand_id)
     return summary
 
@@ -414,6 +415,39 @@ def species_protocol(config, plan, links, conformers):
     return settings, seed, protocol
 
 
+def encounter_protocol_extension(frozen_protocol, requested_protocol):
+    """Allow append-only encounter-plan growth and upward conformer extensions."""
+    if frozen_protocol == requested_protocol:
+        return False
+    return _species_protocol_extension(frozen_protocol, requested_protocol, allow_count_increase=True)
+
+
+def precursor_protocol_extension(frozen_protocol, requested_protocol):
+    """Allow adding new precursor species/links without changing existing chemistry."""
+    return _species_protocol_extension(frozen_protocol, requested_protocol, allow_count_increase=False)
+
+
+def _species_protocol_extension(frozen_protocol, requested_protocol, *, allow_count_increase):
+    old, new = json.loads(frozen_protocol), json.loads(requested_protocol)
+    old_count, new_count = old.pop("conformers", None), new.pop("conformers", None)
+    old_plan, new_plan = old.pop("plan", None), new.pop("plan", None)
+    old_links, new_links = old.pop("links", None), new.pop("links", None)
+    if old != new or not isinstance(old_count, int) or not isinstance(new_count, int):
+        return False
+    if new_count < old_count or (new_count != old_count and not allow_count_increase):
+        return False
+    if not isinstance(old_plan, list) or not isinstance(new_plan, list):
+        return False
+    if not isinstance(old_links, list) or not isinstance(new_links, list):
+        return False
+    encode = lambda values: {json.dumps(value, sort_keys=True, separators=(",", ":")) for value in values}
+    old_plan_set, new_plan_set = encode(old_plan), encode(new_plan)
+    old_links_set, new_links_set = encode(old_links), encode(new_links)
+    if not old_plan_set <= new_plan_set or not old_links_set <= new_links_set:
+        return False
+    return (new_count > old_count or old_plan_set != new_plan_set or old_links_set != new_links_set)
+
+
 def prepare_species(config, root, plan, links, *, conformers=10, reference=False, bound=False,
                     encounter=False, ligand_id=None):
     settings, seed, protocol = species_protocol(config, plan, links, conformers)
@@ -424,9 +458,15 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
     sampling_records = []
     try:
         frozen = connection.execute("SELECT value FROM precursor_metadata WHERE key='protocol'").fetchone()
+        extending_encounters = False
         if frozen and frozen[0] != protocol:
-            raise ValueError("Precursor chemistry/settings changed; use a fresh results directory")
-        connection.execute("INSERT OR IGNORE INTO precursor_metadata VALUES ('protocol',?)", (protocol,))
+            extending_encounters = encounter and encounter_protocol_extension(frozen[0], protocol)
+            extending_precursors = (not encounter and not reference and not bound
+                                    and precursor_protocol_extension(frozen[0], protocol))
+            if not (extending_encounters or extending_precursors):
+                raise ValueError("Precursor chemistry/settings changed; use a fresh results directory")
+        if not frozen:
+            connection.execute("INSERT INTO precursor_metadata VALUES ('protocol',?)", (protocol,))
         for link in links:
             table = "bound_reactant_links" if bound else "precursor_links"
             connection.execute(f"INSERT OR IGNORE INTO {table} VALUES (?,?,?,?,?,?,?,?)", tuple(link.values()))
@@ -448,7 +488,9 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
             geometries, error = [], None
             try:
                 pruning = config.get("sampling", {}).get("prune_rmsd", 0.5)
-                molecule, geometries = sample_precursor(spec, n=conformers, seed=seed, prune_rmsd=pruning)
+                batch_seed = seed + (max(previous, default=0) * 1_000_003 if extending_encounters else 0)
+                molecule, geometries = sample_precursor(spec, n=len(needed), seed=batch_seed,
+                                                        prune_rmsd=pruning)
                 if not geometries:
                     raise ValueError("No precursor conformers survived embedding and pruning")
             except (ValueError, RuntimeError, TimeoutError) as exc:
@@ -456,16 +498,16 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
             sampling_records.append(dict(ligand_id=spec["ligand_id"], endpoint=spec["endpoint"],
                 pair_index=spec["pair_index"] if bound else spec["binding_permutation"],
                 seating=spec["seating"] if bound else spec["protonation_site"],
-                requested=conformers, retained=len(geometries), error=error))
+                requested=len(needed), retained=len(geometries), error=error))
             smiles = Chem.MolToSmiles(molecule)
-            for conformer in needed:
+            for batch_index, conformer in enumerate(needed):
                 relative = precursor_location(spec, conformer)
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                valid = conformer <= len(geometries)
+                valid = batch_index < len(geometries)
                 detail = None if valid or error is None else error
                 if valid:
-                    text = Chem.MolToXYZBlock(geometries[conformer - 1])
+                    text = Chem.MolToXYZBlock(geometries[batch_index])
                     if target.exists() and target.read_text() != text:
                         raise ValueError(f"Existing precursor seed differs: {target}")
                     if not target.exists():
@@ -492,6 +534,8 @@ def prepare_species(config, root, plan, links, *, conformers=10, reference=False
                 if detail:
                     errors.append(dict(ligand_id=spec["ligand_id"], binding_permutation=spec["binding_permutation"],
                                        state=spec["endpoint"], conformer=conformer, error=detail))
+        if frozen and frozen[0] != protocol:
+            connection.execute("UPDATE precursor_metadata SET value=? WHERE key='protocol'", (protocol,))
         summary = dict(species=len(plan), conformers_per_species=conformers, added=added, repaired=repaired,
                        errors=errors, sampling=sampling_records, plan=plan, links=links)
         summary_name = "encounters.json" if encounter else ("acid_base.json" if bound else ("references.json" if reference else "precursors.json"))
@@ -589,9 +633,23 @@ def balanced_diagram_references(connection, reference_database, reaction_databas
                                     read_jobs(reaction_database.with_name("encounters.sqlite")))
 
 
-def load_diagram_inputs(reaction_database, precursor_database=None, reference_database=None, *, energy_mode="auto"):
+def has_plotted_gibbs(row):
+    """Admit only a validated result from the notebook's explicitly loaded method."""
+    import math
+    energy = row.get("gibbs_free_energy_eh")
+    if row.get("status") != "succeeded" or energy is None or not math.isfinite(energy):
+        return False
+    if row.get("energy_method") == "uma":
+        return row.get("method_status") == "succeeded"
+    return row.get("singlepoint_status") == "succeeded" and row.get("singlepoint_job_id") is not None
+
+
+def load_diagram_inputs(reaction_database, precursor_database=None, reference_database=None, *, energy_mode="auto", uma_root=None):
     """Read notebook inputs without creating, upgrading or writing any calculation database."""
     reaction_database = Path(reaction_database).resolve()
+    if energy_mode.lower() == "uma":
+        from hpc_uma import load_uma_diagram_inputs
+        return load_uma_diagram_inputs(reaction_database, uma_root)
     precursor_database = (Path(precursor_database).resolve() if precursor_database is not None
                           else reaction_database.with_name("precursors.sqlite"))
     reference_database = (Path(reference_database).resolve() if reference_database is not None

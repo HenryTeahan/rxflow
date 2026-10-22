@@ -93,6 +93,37 @@ def create_permutations(ligand_smiles, metal, denticity):
         yield selected, mol
 
 
+def retain_coordination_mode(donors, ligand, relative_kcal_mol, cutoff=20.0):
+    """Keep low-energy modes plus tridentate N,N,N arrangements.
+
+    Tridentate nitrogen binding is chemically informative for the exchange
+    screen even when the initial gxTB coordination score puts it just outside
+    the broad conformer-pruning window.
+    """
+    if relative_kcal_mol is None or relative_kcal_mol <= cutoff + 1e-8:
+        return True
+    return len(donors) == 3 and all(ligand.GetAtomWithIdx(index).GetAtomicNum() == 7
+                                    for index in donors)
+
+
+def reaction_pairs_for_coordination_mode(row, mode_index, donors, isomer_index, mol,
+                                         coordination_smiles):
+    """Build the substrate reaction pairs for one already-screened metal isomer."""
+    pairs = []
+    for site, reactant in add_substrate(mol, row["substrate"]):
+        for resonance, acceptor, product in create_products(reactant, row["metal"]):
+            pairs.append({"ligand_id": row["ID"], "mode": mode_index,
+                          "donors": json.dumps(donors), "isomer": isomer_index,
+                          "metal": row["metal"], "metal_geom": row["metal_geom"],
+                          "coordination_smiles": coordination_smiles,
+                          "substrate": row["substrate"], "site": site,
+                          "substrate_site": int(site.removeprefix("site_")),
+                          "resonance": resonance, "acceptor_map": acceptor + 1,
+                          "reactant_smiles": Chem.MolToSmiles(reactant),
+                          "product_smiles": Chem.MolToSmiles(product)})
+    return pairs
+
+
 def ligand_directory(results, ligand_id):
     """Name ligand folders by CSV ID, with at least two digits for numeric IDs."""
     identifier = str(ligand_id)
@@ -248,23 +279,14 @@ def generate_reaction_pairs(row, output, *, executable=None, enumerate_only=Fals
     mode_rows = []
     for mode_index, donors, isomer, energy, mol, coordination_smiles in modes:
         relative = (energy - minimum) * HARTREE_TO_KCAL if energy is not None else None
-        retained = relative is None or relative <= 20.0 + 1e-8
+        retained = retain_coordination_mode(donors, Chem.AddHs(Chem.MolFromSmiles(row["ligand_smiles"])), relative)
         mode_rows.append({"mode": mode_index, "donors": donors, "isomer": isomer,
                           "energy_eh": energy, "relative_kcal_mol": relative, "retained": retained,
                           "coordination_smiles": coordination_smiles})
         if not retained:
             continue
-        for site, reactant in add_substrate(mol, row["substrate"]):
-            for resonance, acceptor, product in create_products(reactant, row["metal"]):
-                pairs.append({"ligand_id": row["ID"], "mode": mode_index,
-                              "donors": json.dumps(donors), "isomer": isomer,
-                              "metal": row["metal"], "metal_geom": row["metal_geom"],
-                              "coordination_smiles": coordination_smiles,
-                              "substrate": row["substrate"], "site": site,
-                              "substrate_site": int(site.removeprefix("site_")),
-                              "resonance": resonance, "acceptor_map": acceptor + 1,
-                              "reactant_smiles": Chem.MolToSmiles(reactant),
-                              "product_smiles": Chem.MolToSmiles(product)})
+        pairs.extend(reaction_pairs_for_coordination_mode(
+            row, mode_index, donors, isomer, mol, coordination_smiles))
     (output / "coordination_modes.json").write_text(json.dumps(mode_rows, indent=2) + "\n")
     (output / "failures.json").write_text(json.dumps(failures, indent=2) + "\n")
     columns = ["ligand_id", "mode", "donors", "isomer", "metal", "metal_geom", "coordination_smiles", "substrate", "site", "substrate_site",

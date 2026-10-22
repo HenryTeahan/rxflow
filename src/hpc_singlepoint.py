@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime, timezone
+import getpass
 import hashlib
 import json
 import math
@@ -15,13 +17,21 @@ import subprocess
 import sys
 import tempfile
 
+from rdkit import Chem
+
+from conformer_sampling import DEFAULT_PRUNE_RMSD, prune_conformers
 from hpc_precursors import reference_root
 from orca_hpc import molecule_with_xyz, orca_input, run_orca
 from rxflow import HARTREE_TO_KCAL
 
 METHOD = "PBE0/def2-TZVP-D4/SMD(water)"
 TS_ENERGY_WINDOW_KCAL = 3.0
-TS_WINDOW_SKIP_REASON = "Outside current 3 kcal/mol TS Gibbs-energy window or source changed"
+ENCOUNTER_ENERGY_WINDOW_KCAL = 5.0
+TS_PRUNE_RMSD = DEFAULT_PRUNE_RMSD
+LEGACY_TS_WINDOW_SKIP_REASON = "Outside current 3 kcal/mol TS Gibbs-energy window or source changed"
+TS_WINDOW_SKIP_REASON = "Outside current 3 kcal/mol TS window, RMSD duplicate, or source changed"
+ENCOUNTER_WINDOW_SKIP_REASON = "Outside current 5 kcal/mol encounter Gibbs-energy window, RMSD duplicate, or source changed"
+WINDOW_SKIP_REASONS = (LEGACY_TS_WINDOW_SKIP_REASON, TS_WINDOW_SKIP_REASON, ENCOUNTER_WINDOW_SKIP_REASON)
 
 
 def read_jobs(path):
@@ -51,8 +61,8 @@ def lowest_jobs(rows):
     return list(best.values())
 
 
-def selected_jobs(rows):
-    """Lowest-G minima and every TS within 3 kcal/mol of its group's lowest gxTB G."""
+def selected_jobs(rows, source):
+    """Select state minima, TS conformers within 3 kcal/mol and encounters within 5."""
     rows = list(rows)
     groups = {}
     for row in rows:
@@ -63,12 +73,70 @@ def selected_jobs(rows):
     for group in groups.values():
         ranked = sorted(group, key=lambda row: (row["gibbs_free_energy_eh"], row["id"]))
         minimum = ranked[0]
-        if minimum["endpoint"] != "TS":
+        if minimum["endpoint"] == "TS":
+            window = TS_ENERGY_WINDOW_KCAL
+        elif minimum["endpoint"] == "encounter":
+            window = ENCOUNTER_ENERGY_WINDOW_KCAL
+        else:
             selected.append(minimum)
             continue
-        cutoff = minimum["gibbs_free_energy_eh"] + TS_ENERGY_WINDOW_KCAL / HARTREE_TO_KCAL
-        selected.extend(row for row in ranked if row["gibbs_free_energy_eh"] <= cutoff + 1e-12)
+        cutoff = minimum["gibbs_free_energy_eh"] + window / HARTREE_TO_KCAL
+        candidates = [row for row in ranked if row["gibbs_free_energy_eh"] <= cutoff + 1e-12]
+        geometries, valid, invalid = [], [], []
+        for row in candidates:
+            try:
+                geometries.append(molecule_with_xyz(row["smiles"], source_geometry(row, source)))
+                valid.append(row)
+            except (ValueError, OSError):
+                # Keep invalid sources visible to preparation/readiness checks.
+                invalid.append(row)
+        kept = {id(mol) for mol in prune_conformers(geometries, TS_PRUNE_RMSD)}
+        selected.extend(row for row, mol in zip(valid, geometries) if id(mol) in kept)
+        selected.extend(invalid)
     return selected
+
+
+def geometry_hash(xyz):
+    """Hash exact elements/coordinates, ignoring XYZ comments and numeric formatting."""
+    lines = xyz.splitlines()
+    try:
+        count = int(lines[0])
+        records = [line.split() for line in lines[2:] if line.strip()]
+    except (ValueError, IndexError) as exc:
+        raise ValueError('Invalid XYZ geometry') from exc
+    if len(records) != count or any(len(record) != 4 for record in records):
+        raise ValueError('XYZ atom count or coordinate records are invalid')
+    mol = Chem.MolFromXYZBlock(xyz)
+    if mol is None or not mol.GetNumAtoms():
+        raise ValueError("Invalid XYZ geometry")
+    coordinates = mol.GetConformer().GetPositions().tolist()
+    if any(not math.isfinite(value) for position in coordinates for value in position):
+        raise ValueError("Nonfinite XYZ coordinates")
+    coordinates = [[0.0 if value == 0 else value for value in position] for position in coordinates]
+    payload = dict(atoms=[atom.GetAtomicNum() for atom in mol.GetAtoms()], coordinates=coordinates)
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def frozen_geometry_matches(job, xyz):
+    """Accept old raw-text hashes and new coordinate hashes without rewriting history."""
+    return job["geometry_sha256"] in (hashlib.sha256(xyz.encode()).hexdigest(), geometry_hash(xyz))
+
+
+def completed_geometry_index(db, root):
+    """Index usable completed results, including queues created with legacy hashes."""
+    index = {}
+    for row in db.execute("SELECT * FROM jobs WHERE status='succeeded' AND method=? ORDER BY id", (METHOD,)):
+        if row["electronic_energy_eh"] is None or not math.isfinite(row["electronic_energy_eh"]):
+            continue
+        try:
+            xyz = (root / row["input_xyz"]).read_text()
+            if not frozen_geometry_matches(row, xyz):
+                continue
+            key = (geometry_hash(xyz), row["charge"], row["multiplicity"])
+        except (ValueError, OSError):
+            continue
+        index.setdefault(key, dict(row))
+    return index
 
 
 def source_fingerprint(row, xyz):
@@ -162,11 +230,13 @@ def plan_singlepoints(config, base, root):
     calculation_settings(config)
     summary = []
     for kind, source, destination in sources(config, base, root):
-        rows = selected_jobs(read_jobs(source))
+        rows = selected_jobs(read_jobs(source), source)
         summary.append(dict(source_kind=kind, source_database=str(source),
                             singlepoint_database=str(destination), selected_states=len(rows),
                             source_available=source.is_file()))
-    return dict(method=METHOD, ts_energy_window_kcal=TS_ENERGY_WINDOW_KCAL, sources=summary,
+    return dict(method=METHOD, ts_energy_window_kcal=TS_ENERGY_WINDOW_KCAL,
+                encounter_energy_window_kcal=ENCOUNTER_ENERGY_WINDOW_KCAL,
+                ts_prune_rmsd=TS_PRUNE_RMSD, sources=summary,
                 selected_states=sum(item["selected_states"] for item in summary))
 
 
@@ -195,10 +265,11 @@ def prepare_singlepoints(config, base, root):
     added = existing = reused = skipped = reactivated = 0
     errors = []
     for kind, source, destination in sources(config, base, root):
-        rows = selected_jobs(read_jobs(source))
+        rows = selected_jobs(read_jobs(source), source)
         if not rows and not destination.is_file():
             continue
         with closing(connect_singlepoints(destination)) as db:
+            completed = completed_geometry_index(db, destination.parent)
             selected_ts = set()
             for row in rows:
                 try:
@@ -208,10 +279,32 @@ def prepare_singlepoints(config, base, root):
                     errors.append(dict(source_kind=kind, source_job_id=row["id"], error=str(exc)))
                     continue
                 identity = (str(source.resolve()), row["id"], fingerprint, METHOD)
-                if row["endpoint"] == "TS":
+                if row["endpoint"] in ("TS", "encounter"):
                     selected_ts.add((row["id"], fingerprint))
-                if db.execute("SELECT id FROM jobs WHERE source_database=? AND source_job_id=? AND source_fingerprint=? AND method=?", identity).fetchone():
+                previous = db.execute("SELECT * FROM jobs WHERE source_database=? AND source_job_id=? AND source_fingerprint=? AND method=?", identity).fetchone()
+                if previous:
                     existing += 1
+                    if (previous["status"] == "skipped" and previous["error"] in
+                            WINDOW_SKIP_REASONS):
+                        db.execute("UPDATE jobs SET status='pending',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='skipped'", (previous["id"],))
+                        reactivated += 1
+                    if previous["status"] in ("pending", "skipped"):
+                        match = completed.get((geometry_hash(xyz), row["charge"], row["multiplicity"]))
+                        if match:
+                            try:
+                                frozen = (destination.parent / previous['input_xyz']).read_text()
+                                if (not frozen_geometry_matches(previous, frozen)
+                                        or geometry_hash(frozen) != geometry_hash(xyz)):
+                                    raise ValueError('Frozen single-point geometry has changed')
+                            except (ValueError, OSError) as exc:
+                                errors.append(dict(source_kind=kind, source_job_id=row['id'], error=str(exc)))
+                                continue
+                            energy = match["electronic_energy_eh"]
+                            corrected = row['gibbs_free_energy_eh'] - row['electronic_energy_eh'] + energy
+                            reused += db.execute("""UPDATE jobs SET status='succeeded',electronic_energy_eh=?,
+                                corrected_gibbs_free_energy_eh=?,out_file=?,reused_from_id=?,error=NULL,
+                                updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'""",
+                                (energy, corrected, match['out_file'], match['id'], previous['id'])).rowcount
                     continue
                 folder = Path(row["xyz_file"]).parent / "singlepoint"
                 method_tag = hashlib.sha256(METHOD.encode()).hexdigest()[:8]
@@ -227,42 +320,33 @@ def prepare_singlepoints(config, base, root):
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (*identity, kind, json.dumps(row, sort_keys=True), json.dumps(settings, sort_keys=True),
                      *(row[name] for name in ("ligand_id", "pair_index", "seating", "endpoint", "conformer", "charge", "multiplicity", "smiles")),
-                     str(relative), hashlib.sha256(xyz.encode()).hexdigest(), row["electronic_energy_eh"], row["gibbs_free_energy_eh"]))
+                     str(relative), geometry_hash(xyz), row["electronic_energy_eh"], row["gibbs_free_energy_eh"]))
                 added += inserted.rowcount
                 existing += int(inserted.rowcount == 0)
                 if inserted.rowcount:
                     # A graph/state label does not affect an electronic single point.
-                    # Reuse only the identical frozen XYZ, charge, spin and method.
-                    for previous in db.execute('''SELECT * FROM jobs WHERE status='succeeded'
-                            AND method=? AND geometry_sha256=? AND charge=? AND multiplicity=?
-                            AND electronic_energy_eh IS NOT NULL ORDER BY id''',
-                            (METHOD, hashlib.sha256(xyz.encode()).hexdigest(), row['charge'], row['multiplicity'])):
-                        frozen = destination.parent / previous['input_xyz']
-                        if (not math.isfinite(previous['electronic_energy_eh']) or not frozen.is_file()
-                                or frozen.read_text() != xyz):
-                            continue
+                    # Reuse exact coordinates, charge, spin and method. XYZ comments
+                    # and formatting do not change the electronic calculation.
+                    previous = completed.get((geometry_hash(xyz), row['charge'], row['multiplicity']))
+                    if previous:
                         energy = previous['electronic_energy_eh']
                         corrected = row['gibbs_free_energy_eh'] - row['electronic_energy_eh'] + energy
                         db.execute('''UPDATE jobs SET status='succeeded',electronic_energy_eh=?,
                             corrected_gibbs_free_energy_eh=?,out_file=?,reused_from_id=? WHERE id=?''',
                             (energy, corrected, previous['out_file'], previous['id'], inserted.lastrowid))
                         reused += 1
-                        break
-            # A newly found lower TS can move an old pending correction outside
-            # the window. Preserve completed work, but do not calculate stale seeds.
-            previous = db.execute("""SELECT id,source_job_id,source_fingerprint,status,error FROM jobs
-                WHERE source_database=? AND endpoint='TS' AND method=?
+            # Preserve completed work, but skip pending corrections removed by
+            # the energy window, optimized RMSD pruning or changed provenance.
+            previous = db.execute("""SELECT id,source_job_id,source_fingerprint,status,error,endpoint FROM jobs
+                WHERE source_database=? AND endpoint IN ('TS','encounter') AND method=?
                 AND status IN ('pending','skipped')""", (str(source.resolve()), METHOD)).fetchall()
             for queued in previous:
                 selected = (queued["source_job_id"], queued["source_fingerprint"]) in selected_ts
                 if queued["status"] == "pending" and not selected:
+                    reason = ENCOUNTER_WINDOW_SKIP_REASON if queued["endpoint"] == "encounter" else TS_WINDOW_SKIP_REASON
                     db.execute("UPDATE jobs SET status='skipped',error=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'",
-                               (TS_WINDOW_SKIP_REASON, queued["id"]))
+                               (reason, queued["id"]))
                     skipped += 1
-                elif queued["status"] == "skipped" and selected and queued["error"] == TS_WINDOW_SKIP_REASON:
-                    db.execute("UPDATE jobs SET status='pending',error=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='skipped'",
-                               (queued["id"],))
-                    reactivated += 1
     result = dict(**plan, added=added, existing=existing, reused=reused, skipped=skipped,
                   reactivated=reactivated, errors=errors, settings=settings)
     root.mkdir(parents=True, exist_ok=True)
@@ -289,7 +373,7 @@ def run_singlepoint(db, job, root, orca_exe, mpirun_exe=None):
     output = Path(job["input_xyz"]).parent / f"{stem}.out"
     try:
         xyz = (root / job["input_xyz"]).read_text()
-        if hashlib.sha256(xyz.encode()).hexdigest() != job["geometry_sha256"]:
+        if not frozen_geometry_matches(job, xyz):
             raise ValueError("Frozen single-point geometry has changed")
         molecule_with_xyz(job["smiles"], xyz)
         settings = {**json.loads(job["settings_json"]), "orca_exe": orca_exe}
@@ -330,7 +414,7 @@ def apply_singlepoint_energies(data, reaction_database, precursor_database, refe
         index = {(row["source_database"], row["source_job_id"], row["source_fingerprint"]): row
                  for row in records if row["method"] == METHOD}
         matches = {}
-        for row in selected_jobs(data[key]):
+        for row in selected_jobs(data[key], source):
             state, sp, detail = "not_queued", None, None
             try:
                 xyz = source_geometry(row, source)
@@ -432,22 +516,73 @@ def singlepoint_status(config, base, root):
     return result
 
 
-def submit_singlepoints(config_path, config, *, workers=10, account=None, partition=None, resume=False):
+def reset_interrupted_singlepoints(config, base, root):
+    """Back up and reset interrupted SP rows after their Slurm workers have stopped."""
+    interrupted = {}
+    for path in database_paths(config, base, root):
+        rows = [row for row in read_jobs(path) if row['status'] == 'running' and row['method'] == METHOD]
+        if rows:
+            interrupted[path] = rows
+    if not interrupted:
+        return dict(reset=0, backup=None)
+    worker_ids = {(row.get('worker_id') or '').split(':')[0]
+                  for rows in interrupted.values() for row in rows}
+    if any(not worker.isdigit() for worker in worker_ids) or not shutil.which('squeue'):
+        raise ValueError('Cannot verify interrupted Slurm workers; use singlepoint retry --id after stopping each worker')
+    live = set(subprocess.check_output(['squeue', '--noheader', '--array',
+               '--user', getpass.getuser(), '--format=%A %F'], text=True).split())
+    if worker_ids & live:
+        raise ValueError('Stop the old single-point workers and wait for them to leave squeue before --reset-running')
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+    backup = root / 'singlepoint_restarts' / stamp
+    backup.mkdir(parents=True)
+    report = dict(reset=0, backup=str(backup), databases=[])
+    # Snapshot every affected queue before resetting any rows, including shared references.
+    for index, (path, rows) in enumerate(interrupted.items()):
+        target = backup / f'{index:02d}_{path.parent.name}_singlepoints.sqlite'
+        with closing(sqlite3.connect(path)) as source, closing(sqlite3.connect(target)) as destination:
+            source.backup(destination)
+        report['databases'].append(dict(database=str(path), backup=str(target), jobs=rows))
+    (backup / 'restart.json').write_text(json.dumps(report, indent=2) + '\n')
+    for path, rows in interrupted.items():
+        with closing(connect_singlepoints(path)) as db:
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                for row in rows:
+                    report['reset'] += db.execute("""UPDATE jobs SET status='pending',worker_id=NULL,error=NULL,
+                        electronic_energy_eh=NULL,corrected_gibbs_free_energy_eh=NULL,out_file=NULL,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='running' AND worker_id=?""",
+                        (row['id'], row['worker_id'])).rowcount
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+    (backup / 'restart.json').write_text(json.dumps(report, indent=2) + '\n')
+    return dict(reset=report['reset'], backup=report['backup'],
+                databases=[dict(database=item['database'], backup=item['backup'], interrupted=len(item['jobs']))
+                           for item in report['databases']])
+
+
+def submit_singlepoints(config_path, config, *, workers=10, account=None, partition=None, resume=False, reset_running=False):
     if workers < 1:
         raise ValueError("Single-point worker count must be positive")
     base = config_path.resolve().parent
     root = (base / config["paths"]["results"]).resolve()
-    if not resume:
-        prepared = prepare_singlepoints(config, base, root)
-        if prepared["errors"]:
-            raise ValueError(f"Cannot prepare all selected states: {prepared['errors']}")
+    if reset_running and not resume:
+        raise ValueError('--reset-running is only supported with singlepoint resume')
+    settings = calculation_settings(config)
+    recovery = reset_interrupted_singlepoints(config, base, root) if reset_running else None
+    # Resume must reconcile the current energy window and optimized RMSD selection,
+    # rather than draining an old, unpruned pending queue.
+    prepared = prepare_singlepoints(config, base, root)
+    if prepared["errors"]:
+        raise ValueError(f"Cannot prepare all selected states: {prepared['errors']}")
     paths = database_paths(config, base, root)
     if not any(path.is_file() for path in paths):
         raise ValueError("No single-point database exists; use singlepoint prepare or submit first")
-    settings = calculation_settings(config)
     pending = [row for path in paths for row in read_jobs(path) if row["status"] == "pending" and row["method"] == METHOD]
     if not pending:
-        return dict(workers=None, pending=0, method=METHOD)
+        return dict(workers=None, pending=0, method=METHOD, preparation=prepared, recovery=recovery)
     for row in pending:
         frozen = json.loads(row["settings_json"])
         if any(frozen[name] > settings[name] for name in ("cpus", "memory_mb", "timeout_seconds")):
@@ -467,7 +602,8 @@ def submit_singlepoints(config_path, config, *, workers=10, account=None, partit
             args.append(f"--{flag}={value}")
     wrap = "export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1; exec " + command
     job_id = subprocess.check_output([*args, "--wrap", wrap], text=True).strip().split(";")[0]
-    return dict(workers=job_id, pending=len(pending), array_workers=workers, method=METHOD, settings=settings)
+    return dict(workers=job_id, pending=len(pending), array_workers=workers, method=METHOD, settings=settings,
+                preparation=prepared, recovery=recovery)
 
 
 def handle_singlepoints(args, config, base, root, parser):
@@ -475,6 +611,8 @@ def handle_singlepoints(args, config, base, root, parser):
     if action is None:
         parser.error("singlepoint requires plan, prepare, submit, worker, status, retry, or resume")
     try:
+        if getattr(args, 'reset_running', False) and action != 'resume':
+            raise ValueError('--reset-running is only supported with singlepoint resume')
         if action in ("plan", "prepare", "status"):
             function = {"plan": plan_singlepoints, "prepare": prepare_singlepoints, "status": singlepoint_status}[action]
             print(json.dumps(function(config, base, root), indent=2))
@@ -500,7 +638,8 @@ def handle_singlepoints(args, config, base, root, parser):
             if not shutil.which("sbatch"):
                 raise ValueError("singlepoint submit/resume requires Slurm's sbatch command")
             print(json.dumps(submit_singlepoints(args.config, config, workers=args.workers,
-                  account=args.account, partition=args.partition, resume=action == "resume"), indent=2))
+                  account=args.account, partition=args.partition, resume=action == "resume",
+                  reset_running=getattr(args, 'reset_running', False)), indent=2))
             return
         mpi = mpi_executable(config, base) if calculation_settings(config)["cpus"] > 1 else None
         if calculation_settings(config)["cpus"] > 1 and mpi is None:

@@ -473,12 +473,13 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
 
     def score_guess():
         nonlocal scan_report
-        update_job(connection, job["id"], stage="gxtb_scan")
+        method = "uma" if settings.get("method") == "uma" else "gxtb"
+        update_job(connection, job["id"], stage=f"{method}_scan")
         try:
             scan_report = score_ts_scan(job, root, settings, source)
         except Exception as exc:
             report_file = (root / Path(job["input_xyz"]).parent /
-                           f"job_{job['id']}_run_{job['attempt']:02d}_gxtb_scan" / "scoring.json")
+                           f"job_{job['id']}_run_{job['attempt']:02d}_{method}_scan" / "scoring.json")
             scan_report = (json.loads(report_file.read_text()) if report_file.is_file()
                            else dict(valid=False, error=str(exc)))
             update_job(connection, job["id"], ts_scan_json=json.dumps(scan_report))
@@ -496,6 +497,20 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
         return result
 
     def calculate_frequency(attempt=1):
+        if job["endpoint"] == "TS" and settings.get("method") == "uma":
+            changes = connectivity_changes(molecule_with_xyz(job["smiles"], current),
+                                           molecule_with_xyz(job["smiles"], original))
+            transfer = {frozenset((job["donor"], job["hydrogen"])),
+                        frozenset((job["acceptor"], job["hydrogen"]))}
+            # The intended proton-transfer bonds can change; unrelated bonds
+            # and the metal coordination must still pass the normal checks.
+            changes = {**changes,
+                       "formed": [pair for pair in changes.get("formed", []) if frozenset(pair) not in transfer],
+                       "broken": [pair for pair in changes.get("broken", []) if frozenset(pair) not in transfer],
+                       "distance_changes": [record for record in changes.get("distance_changes", [])
+                                            if frozenset(record["atoms"]) not in transfer]}
+            if any(changes.values()):
+                raise ValueError(f"TS connectivity changed outside the intended H transfer: {changes}")
         path.write_text(current)
         update_job(connection, job["id"], xyz_file=str(path.relative_to(root)))
         result = calculate("freq", attempt)
@@ -551,7 +566,7 @@ def run_job(connection, job, root, executables, *, source=None, sampling=None):
             raise ValueError(f"Graph change or bond-length change exceeding {CONNECTIVITY_DISTANCE_CHANGE_ANGSTROM:g} angstrom: {changes}")
 
     def endpoint_changes(endpoint_job, current, reference):
-        if endpoint_job["endpoint"] == "encounter":
+        if endpoint_job["endpoint"] == "encounter" and settings.get("method") != "uma":
             return {}
         return connectivity_changes(molecule_with_xyz(endpoint_job["smiles"], current),
                                     molecule_with_xyz(endpoint_job["smiles"], reference))
@@ -951,26 +966,35 @@ def submit_workflow(config_path, config, *, workers=100, conformers=10, account=
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("hpc.toml"))
-    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry", "retry-ts", "ts-recovery-status", "precursors", "acid-base", "singlepoint", "verify-ts", "filter-endpoints"))
-    parser.add_argument("precursor_command", nargs="?", choices=("submit", "prepare", "worker", "status", "retry", "resume", "plan"),
-                        help="Action for the precursors, acid-base or singlepoint workflow")
-    parser.add_argument("--conformers", type=int, default=10, help="Fresh conformers per precursor species (default 10)")
+    parser.add_argument("command", choices=("submit", "resume", "sample", "prepare", "worker", "status", "retry", "retry-ts", "ts-recovery-status", "precursors", "acid-base", "singlepoint", "uma", "verify-ts", "filter-endpoints"))
+    parser.add_argument("precursor_command", nargs="?", choices=("submit", "prepare", "worker", "status", "retry", "resume", "plan", "verify-ts"),
+                        help="Action for the precursors, acid-base, singlepoint or UMA workflow")
+    parser.add_argument("--conformers", type=int, default=10, help="Fresh conformers per precursor species (default 10); encounter count may be set separately in sampling.encounter_conformers")
     parser.add_argument("--id", type=int, help="Specific row to retry or verify with verify-ts")
     parser.add_argument("--ligand-index", type=int, help="Zero-based CSV row for a sampling array task")
     parser.add_argument("--ligand-id", help="Restrict filter-endpoints to one ligand ID")
-    parser.add_argument("--workers", type=int, help="Workers for submit/resume (default 10 for singlepoint, otherwise 100)")
+    parser.add_argument("--workers", type=int, help="Workers for submit/resume (default 10 for singlepoint/UMA, otherwise 100)")
     parser.add_argument("--references", action="store_true", help="Retry an ID in the shared single-point reference database")
+    parser.add_argument("--reset-running", action="store_true",
+                        help="With singlepoint resume: verify old Slurm workers stopped, back up queues and reset interrupted rows")
     parser.add_argument("--bound", action="store_true", help="Target the per-run protonated bound complexes for acid-base retry")
     parser.add_argument("--encounters", action="store_true", help="Target the encounter queue for precursors retry")
+    parser.add_argument("--queue", choices=("reaction", "encounter", "precursor", "bound", "reference"), default="reaction",
+                        help="UMA queue for retry (default: reaction)")
     parser.add_argument("--account", help="Slurm account for submit/resume")
     parser.add_argument("--partition", help="Slurm partition for submit/resume")
-    parser.add_argument("--dry-run", action="store_true", help="For verify-ts/retry-ts/filter-endpoints, report checks without changing jobs or writing files")
+    parser.add_argument("--dry-run", action="store_true", help="Preview verify-ts/retry-ts/filter-endpoints or UMA preparation/submission without changing jobs")
     args = parser.parse_args(argv)
+    if args.reset_running and (args.command != 'singlepoint' or args.precursor_command != 'resume'):
+        parser.error('--reset-running is only supported with singlepoint resume')
     if args.workers is None:
-        args.workers = 10 if args.command == "singlepoint" else 100
+        args.workers = 10 if args.command in ("singlepoint", "uma") else 100
     config = tomllib.loads(args.config.read_text())
     base = args.config.resolve().parent
     root = (base / config["paths"]["results"]).resolve()
+    if args.command == "uma":
+        from hpc_uma import handle_uma
+        return handle_uma(args, config, base, root, parser)
     if args.command not in ("verify-ts", "retry-ts", "ts-recovery-status", "filter-endpoints"):
         root.mkdir(parents=True, exist_ok=True)
     settings = config["calculation"]
@@ -981,7 +1005,7 @@ def main(argv=None):
             parser.error(f"calculation.{key} must be positive")
     sampling = config.get("sampling", {})
     for key, default in (("endpoint_conformers", 20), ("coembed_conformers", 10),
-                         ("ts_candidates", 5), ("ts_conformers", 20)):
+                         ("encounter_conformers", 20), ("ts_candidates", 5), ("ts_conformers", 20)):
         value = sampling.get(key, default)
         if type(value) is not int or value < 1:
             parser.error(f"sampling.{key} must be a positive integer")

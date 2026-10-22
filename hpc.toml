@@ -1,5 +1,5 @@
 [paths]
-ligands_csv = "ligands.csv"
+ligands_csv = "Pd_TM_ligands.csv"
 source = "hpc_tm_seeds"
 results = "hpc_tm_results"
 
@@ -13,7 +13,10 @@ xtb_exe = "${XTB_EXE}"
 
 [sampling]
 endpoint_conformers = 20
+ts_conformers = 20
+prune_rmsd = 0.5
 coembed_conformers = 10
+encounter_conformers = 20
 ts_candidates = 5
 seed = 12345
 

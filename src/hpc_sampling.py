@@ -18,13 +18,30 @@ def sample_ligand(row, output, executable, *, endpoint_conformers=20, coembed_co
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Sampling already exists in {output}; choose a fresh source directory")
     pairs = generate_reaction_pairs(row, output, executable=executable, seed=seed, prune_rmsd=prune_rmsd)
+    summary = sample_reaction_pairs(
+        row, pairs, output, first_pair_index=1, endpoint_conformers=endpoint_conformers,
+        coembed_conformers=coembed_conformers, ts_candidates=ts_candidates,
+        ts_conformers=ts_conformers, prune_rmsd=prune_rmsd, seed=seed)
+    summary["ligand_id"] = row["ID"]
+    (output / "sampling.json").write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
+
+
+def sample_reaction_pairs(row, pairs, output, *, first_pair_index, endpoint_conformers=20,
+                          coembed_conformers=10, ts_candidates=5, ts_conformers=20,
+                          prune_rmsd=DEFAULT_PRUNE_RMSD, seed=12345):
+    """Sample endpoint and TS seeds for appended reaction-pair rows in an existing seed tree."""
+    output = Path(output)
     errors = []
     endpoint_sampling = []
     groups = 0
-    for index, pair in enumerate(pairs, 1):
+    for index, pair in enumerate(pairs, first_pair_index):
         for seating, reactant, product in create_endpoint_isomers(pair):
             prefix = f"pair_{index:03d}_seating_{seating + 1:02d}"
-            (output / f"{prefix}_endpoints.json").write_text(json.dumps({
+            descriptor = output / f"{prefix}_endpoints.json"
+            if descriptor.exists():
+                raise FileExistsError(f"Endpoint seeds already exist for pair {index}, seating {seating + 1}")
+            descriptor.write_text(json.dumps({
                 "reactant": rxembed.cxsmiles(reactant), "product": rxembed.cxsmiles(product),
                 "substrate": row["substrate"]}, indent=2) + "\n")
             for role, isomer in (("reactant", reactant), ("product", product)):
@@ -50,14 +67,13 @@ def sample_ligand(row, output, executable, *, endpoint_conformers=20, coembed_co
                 groups += 1
             except Exception as exc:
                 errors.append({"pair": index, "seating": seating + 1, "endpoint": "TS", "error": str(exc)})
-    summary = dict(ligand_id=row["ID"], groups=groups, errors=errors,
+    summary = dict(groups=groups, errors=errors,
                    endpoint_conformers=endpoint_conformers, coembed_conformers=coembed_conformers,
                    ts_candidates=ts_candidates, ts_conformers=ts_conformers, prune_rmsd=prune_rmsd,
                    endpoint_sampling=endpoint_sampling, seed=seed)
     if not groups and not errors:
         errors.append({"error": "No reaction/seating groups produced"})
     summary["status"] = "completed_with_errors" if errors else "complete"
-    (output / "sampling.json").write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
 

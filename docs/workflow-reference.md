@@ -97,7 +97,11 @@ sampled successful TSs compete for the lowest Gibbs energy.
 DFT single points use PBE0/def2-TZVP-D4/SMD(water) without geometry optimization.
 For each ligand/pair/seating, select every successful original or sampled TS with
 `G(g-xTB NumFreq) − G(group minimum) ≤ 3 kcal/mol`, including the boundary.
-Other states contribute their lowest-G successful conformer.
+Prune these optimized TS geometries with Prism at 0.5 Å heavy-atom RMSD, in
+ascending Gibbs-energy order. Keep the lowest-G representatives and preserve
+distinct molecular identities. Both preparation and notebook readiness use this
+same selection; this catches distinct embeddings that converge to the same TS.
+For encounter states, select every successful RMSD-distinct conformer within 5 kcal/mol of the gxTB NumFreq minimum. The target is 20 encounter conformers per ligand–binding arrangement (`sampling.encounter_conformers`); increasing the target appends seeds while preserving existing results. Other states contribute their lowest-G successful conformer.
 
 Each selected geometry has its own correction:
 
@@ -112,10 +116,21 @@ corrected results with missing states left unavailable.
 
 Single points record the source database, job, attempt, geometry hash, charge,
 multiplicity, method and source energies. Changed sources invalidate corrections.
-An identical frozen XYZ with matching charge, multiplicity and method can reuse
+Identical frozen elements/coordinates with matching charge, multiplicity and method can reuse
 a completed electronic energy, combined with the new source's thermal correction.
-Pending TS corrections outside a newly computed window are skipped; completed
-calculations are preserved. Unchanged skipped sources can reenter the window.
+XYZ comment lines and numeric formatting are ignored for reuse. Existing raw-text
+hashes remain valid; historical completed rows are not rewritten.
+Pending TS corrections outside the current window or removed by optimized RMSD
+pruning are skipped; completed calculations are preserved. Skipped sources can
+be reactivated when selected again. `singlepoint resume` always refreshes this selection.
+
+After cancelling the old SP arrays and waiting for their removal from `squeue`,
+use `singlepoint resume --reset-running --workers 10 --partition kemi1` with the
+run's config. This verifies the recorded workers have stopped, creates SQLite
+backups and a row manifest under `singlepoint_restarts/`, resets interrupted
+running rows while preserving attempt numbers, then prepares and submits the
+remaining selected work. Ongoing selected calculations are left running unless
+this stopped-worker recovery is explicitly requested.
 
 ## Precursors, encounters and acid/base states
 
@@ -234,6 +249,16 @@ In `reaction_diagrams.ipynb`, set `DB_PATH` and rerun all cells. Adjacent precur
 and shared reference databases are read without modifying their calculation rows.
 The notebook preserves pathway/resonance identities and exposes `diagram_rows`,
 `barrier_report`, `reactant_ts_report` and `low_energy_failed_paths`.
+The final **Likely active ligands** section exposes `likely_active_ligands` and
+`active_pathways`. A qualifying pathway has both barriers ≤25 kcal/mol and its
+lower bound/encounter reactant within 3 kcal/mol of the ligand's lowest available
+bound or encounter reactant across all comparable groups, including groups
+without a TS. Substrate, charge and multiplicity stay the same in each comparison.
+A competing pathway in the same reactant window vetoes the entire ligand when
+its product is below an otherwise qualifying pathway's product and its reverse
+barrier is >25 kcal/mol, even if its forward barrier is >25 kcal/mol. The final
+section lists these exclusions; `thermodynamic_traps` and
+`trap_disqualified_ligands` expose the reasons and excluded ligand IDs.
 
 Forward barriers use `G(TS) − min[G(encounter), G(bound reactant)]`; when the
 encounter is missing, the bound reactant is used. Reverse barriers use

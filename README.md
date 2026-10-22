@@ -29,7 +29,7 @@ worker arrays to finish. `resume` reuses the prepared run and completed results.
 | Initial TS guesses | Coembed 10 pairs; use up to 5 with the lowest TS RMSDs for rxts scans |
 | TS conformational sampling | Reembed the group's lowest validated TS into 20 conformers with donor/H/acceptor fixed |
 | Pruning | Prism heavy-atom RMSD, 0.5 Å; coembedded pairs remain unpruned |
-| DFT selection | Each minimum's lowest-G conformer; all validated TSs within 3 kcal/mol of their group's lowest NumFreq Gibbs energy |
+| DFT selection | Each minimum's lowest-G conformer; TSs within 3 kcal/mol of their group's lowest NumFreq Gibbs energy, then optimized-geometry Prism pruning at 0.5 Å, lowest G first |
 
 A TS group is one **ligand / reaction pair / seating**. Requested conformer counts
 are embedding budgets; pruning can leave fewer calculations.
@@ -101,7 +101,9 @@ Embedding and precursor preparation run on compute nodes.
 | Work | Default allocation |
 | --- | --- |
 | Reaction and precursor workers | 100 workers per array; 1 CPU and 2 GB each |
-| Precursor/encounter sampling | 10 conformers per species before pruning; controlled by `--conformers` |
+| Precursor sampling | 10 conformers per species before pruning; controlled by `--conformers` |
+| Encounter sampling | 20 conformers per ligand–binding arrangement; controlled by `sampling.encounter_conformers` |
+| Encounter DFT selection | RMSD-distinct optimized minima within 5 kcal/mol of the gxTB minimum |
 | DFT single points | Up to 10 workers; 4 CPUs and 8 GB each |
 
 `--workers` changes the reaction/precursor array sizes. `[calculation]` controls
@@ -140,6 +142,15 @@ G(corrected) = E(DFT) + G(g-xTB NumFreq) − E(g-xTB NumFreq)
 
 ## Monitor and recover
 
+### Optional portable UMA runs
+
+`rxflow --config uma.example.toml uma plan` previews the lowest plotted
+conformers to reoptimize with ORCA/UMA. `uma prepare` creates a self-contained
+folder that can be copied to another CPU/GPU cluster, run there, and copied back.
+Both notebooks support `ENERGY_MODE = "uma"`, with separate method results and
+the existing connectivity/TS validation. Executables and model arguments remain
+configurable; see the [UMA workflow guide](docs/uma-workflow.md).
+
 ```sh
 squeue -u "$USER"
 rxflow --config my_run.toml status
@@ -164,7 +175,19 @@ then submit its workers again:
 | One DFT single point | `rxflow --config my_run.toml singlepoint retry --id ID` |
 
 Use `resume` after reaction/precursor resets, or `singlepoint resume` after DFT
-resets. Failed rows are not retried automatically. See the
+resets. To restart interrupted SP workers, first cancel their Slurm arrays and
+wait until they have left `squeue`, then run:
+
+```sh
+rxflow --config my_run.toml singlepoint resume --reset-running --workers 10 --partition kemi1
+```
+
+This checks the old workers have stopped, backs up interrupted SP queues, resets
+their running rows, and refreshes the pruned selection before submitting workers.
+Completed results are preserved. Exact-geometry reuse ignores XYZ comments and
+formatting, while matching charge, spin and method.
+
+Failed rows are not retried automatically. See the
 [reference guide](docs/workflow-reference.md#recovery-and-individual-stages) for
 sampling failures, mode audits and unsatisfied Slurm dependencies.
 

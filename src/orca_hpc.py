@@ -70,13 +70,14 @@ def orca_input(xyz, stage, charge, multiplicity, settings, atoms=()):
                 '%cpcm\n smd true\n SMDsolvent "water"\nend\n'
                 f"* xyz {charge} {multiplicity}\n"
                 + "\n".join(xyz.splitlines()[2:2 + count]) + "\n*\n")
-    parameters = shlex.join(["-e", settings["xtb_exe"], "-s", settings["solvent"]])
+    parameters = (settings["external_params"] if settings.get("method") == "uma" else
+                  shlex.join(["-e", settings["xtb_exe"], "-s", settings["solvent"]]))
     external = settings["external_exe"]
     if any(c in external + parameters for c in ('"', '\n', '\r')):
         raise ValueError("ORCA external paths/parameters contain quote or newline delimiters")
     keyword = {"opt": "Opt", "verytightopt": "VeryTightOpt", "relax": "Opt", "ts_preopt": "Opt",
                "neb_reactant_opt": "Opt", "neb_product_opt": "Opt", "optts": "OptTS",
-               "neb": "NEB-TS", "freq": "NumFreq"}[stage]
+               "neb": "NEB-TS", "freq": "NumFreq", "external_sp": "SP"}[stage]
     header = (f"! ExtOpt {keyword}\n%pal nprocs {settings['cpus']} end\n"
               f"%maxcore {int(settings['memory_mb'] * 0.75 / settings['cpus'])}\n"
               f'%method\n ProgExt "{external}"\n Ext_Params "{parameters}"\nend\n')
@@ -284,7 +285,7 @@ def run_orca(job, root, settings, stage, xyz, *, attempt=1, neb_endpoints=None):
             result["converged"] = result["converged"] and result["xyz"] is not None
             if stage == "freq":
                 result.update(collect_numfreq(text, int(xyz.splitlines()[0])))
-            if stage == "singlepoint":
+            if stage in ("singlepoint", "external_sp"):
                 if not normal:
                     raise ValueError("ORCA single point failed or timed out")
                 result.update(collect_singlepoint(text))

@@ -9,6 +9,7 @@ description = "Transition-metal reaction sampling and ORCA HPC workflow"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "rxembed[workflow]",
+    "prism-pruner>=0.1.2",
     "rxts[ff]",
     "ipykernel",
     "jupyterlab",
@@ -21,7 +22,8 @@ dependencies = [
 rxflow = "hpc_workflow:main"
 
 [tool.setuptools]
-py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "hpc_precursors", "hpc_encounters", "hpc_singlepoint", "orca_hpc", "run_workflow", "ts_scan"]
+package-dir = {"" = "src"}
+py-modules = ["rxflow", "rxflow_endpoints", "hpc_workflow", "hpc_sampling", "hpc_precursors", "hpc_encounters", "hpc_singlepoint", "hpc_uma", "orca_hpc", "run_workflow", "ts_scan", "conformer_sampling"]
 
 [tool.uv]
 # Apply the rxembed pin to rxts's transitive requirement too.

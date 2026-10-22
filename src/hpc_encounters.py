@@ -198,18 +198,20 @@ def import_encounter_minima(config, root, plan, *, conformers=10, ligand_id=None
 
 
 def prepare_encounters(config, base, root, *, conformers=10, ligand_id=None):
-    from hpc_precursors import prepare_species, species_protocol
+    from hpc_precursors import encounter_protocol_extension, prepare_species, species_protocol
     if conformers < 1:
         raise ValueError('Encounter conformer count must be positive')
     plan = encounter_plan(config, base, root)
     if ligand_id is not None and not any(str(s['ligand_id']) == str(ligand_id) for s in plan):
         raise ValueError(f'No encounter binding arrangements for ligand {ligand_id}')
-    # Reject protocol changes before importing geometries or altering the queue.
+    # Validate before importing or changing any queue rows. Only an upward
+    # conformer-count change is allowed for an existing encounter database.
     database = root / 'encounters.sqlite'
     if database.is_file():
         with closing(sqlite3.connect(f'file:{database}?mode=ro', uri=True)) as db:
             frozen = db.execute("SELECT value FROM precursor_metadata WHERE key='protocol'").fetchone()
-        if frozen and frozen[0] != species_protocol(config, plan, [], conformers)[2]:
+        requested = species_protocol(config, plan, [], conformers)[2]
+        if frozen and frozen[0] != requested and not encounter_protocol_extension(frozen[0], requested):
             raise ValueError('Encounter chemistry/settings changed; use a fresh results directory')
     requeued = requeue_filtered_encounters(root, ligand_id=ligand_id)
     imported = import_encounter_minima(config, root, plan, conformers=conformers, ligand_id=ligand_id)

@@ -49,8 +49,8 @@ STEP 3:
 GUIDANCE: This should be a very minimal but clearly written code structure. Do not abstract functions too much. Use the code supplied by me as much as possible.
 The regular submit/resume workflow schedules precursor and uncoordinated
 substrate encounter preparation on Slurm, followed by precursor workers.
-Encounter sampling covers each retained ligand–metal binding arrangement and
-shares equivalent site/resonance routes. A dependent singlepoint submission job
+Encounter sampling requests 20 conformers for each retained ligand–metal binding arrangement and
+shares equivalent site/resonance routes. PBE0 single points cover RMSD-distinct optimized encounter minima within 5 kcal/mol of the gxTB minimum. A dependent singlepoint submission job
 selects minima after both reaction and precursor worker arrays terminate.
 DFT selection takes the lowest-G minimum per state and all validated TS conformers
 within 3 kcal/mol of the lowest g-xTB NumFreq Gibbs energy per ligand/pair/seating.
